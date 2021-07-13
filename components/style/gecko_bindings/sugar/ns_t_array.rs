@@ -5,7 +5,7 @@
 //! Rust helpers for Gecko's nsTArray.
 
 use crate::gecko_bindings::bindings;
-use crate::gecko_bindings::structs::{nsTArray, nsTArrayHeader};
+use crate::gecko_bindings::structs::{nsTArray, nsTArrayHeader, CopyableTArray};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::slice;
@@ -13,6 +13,7 @@ use std::slice;
 impl<T> Deref for nsTArray<T> {
     type Target = [T];
 
+    #[inline]
     fn deref<'a>(&'a self) -> &'a [T] {
         unsafe { slice::from_raw_parts(self.slice_begin(), self.header().mLength as usize) }
     }
@@ -126,5 +127,18 @@ impl<T> nsTArray<T> {
             self.set_len_pod(iter.len() as u32);
         }
         self.iter_mut().zip(iter).for_each(|(r, v)| *r = v);
+    }
+}
+
+impl<T> Deref for CopyableTArray<T> {
+    type Target = nsTArray<T>;
+    fn deref(&self) -> &Self::Target {
+        &self._base
+    }
+}
+
+impl<T> DerefMut for CopyableTArray<T> {
+    fn deref_mut(&mut self) -> &mut nsTArray<T> {
+        &mut self._base
     }
 }

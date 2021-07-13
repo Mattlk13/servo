@@ -18,11 +18,11 @@ use std::fmt::{self, Write};
 use std::mem::ManuallyDrop;
 use std::sync::RwLock;
 use style_traits::{CssWriter, ParseError, ToCss};
-use to_shmem::{SharedMemoryBuilder, ToShmem};
+use to_shmem::{self, SharedMemoryBuilder, ToShmem};
 
 /// A CSS url() value for gecko.
-#[css(function = "url")]
 #[derive(Clone, Debug, PartialEq, SpecifiedValueInfo, ToCss, ToShmem)]
+#[css(function = "url")]
 #[repr(C)]
 pub struct CssUrl(pub Arc<CssUrlData>);
 
@@ -109,7 +109,11 @@ impl CssUrlData {
     /// Returns true if this URL looks like a fragment.
     /// See https://drafts.csswg.org/css-values/#local-urls
     pub fn is_fragment(&self) -> bool {
-        self.as_str().chars().next().map_or(false, |c| c == '#')
+        self.as_str()
+            .as_bytes()
+            .iter()
+            .next()
+            .map_or(false, |b| *b == b'#')
     }
 
     /// Return the unresolved url as string, or the empty string if it's
@@ -241,11 +245,11 @@ impl LoadDataSource {
 }
 
 impl ToShmem for LoadDataSource {
-    fn to_shmem(&self, _builder: &mut SharedMemoryBuilder) -> ManuallyDrop<Self> {
-        ManuallyDrop::new(match self {
+    fn to_shmem(&self, _builder: &mut SharedMemoryBuilder) -> to_shmem::Result<Self> {
+        Ok(ManuallyDrop::new(match self {
             LoadDataSource::Owned(..) => LoadDataSource::Lazy,
             LoadDataSource::Lazy => LoadDataSource::Lazy,
-        })
+        }))
     }
 }
 
@@ -285,14 +289,13 @@ impl SpecifiedImageUrl {
 
     /// Provides an alternate method for parsing that associates the URL
     /// with anonymous CORS headers.
-    pub fn parse_with_cors_anonymous<'i, 't>(
+    pub fn parse_with_cors_mode<'i, 't>(
         context: &ParserContext,
         input: &mut Parser<'i, 't>,
+        cors_mode: CorsMode,
     ) -> Result<Self, ParseError<'i>> {
         Ok(SpecifiedImageUrl(SpecifiedUrl::parse_with_cors_mode(
-            context,
-            input,
-            CorsMode::Anonymous,
+            context, input, cors_mode,
         )?))
     }
 }

@@ -8,10 +8,8 @@ ${helpers.two_properties_shorthand(
     "overflow",
     "overflow-x",
     "overflow-y",
-    "specified::Overflow::parse",
     engines="gecko servo-2013 servo-2020",
     flags="SHORTHAND_IN_GETCS",
-    needs_context=False,
     spec="https://drafts.csswg.org/css-overflow/#propdef-overflow",
 )}
 
@@ -19,20 +17,17 @@ ${helpers.two_properties_shorthand(
     "overflow-clip-box",
     "overflow-clip-box-block",
     "overflow-clip-box-inline",
-    "specified::OverflowClipBox::parse",
     engines="gecko",
     enabled_in="ua",
-    needs_context=False,
     gecko_pref="layout.css.overflow-clip-box.enabled",
     spec="Internal, may be standardized in the future "
          "(https://developer.mozilla.org/en-US/docs/Web/CSS/overflow-clip-box)",
 )}
 
-#[cfg(any(feature = "gecko", feature = "servo-layout-2013"))]
 macro_rules! try_parse_one {
     ($context: expr, $input: expr, $var: ident, $prop_module: ident) => {
         if $var.is_none() {
-            if let Ok(value) = $input.try(|i| {
+            if let Ok(value) = $input.try_parse(|i| {
                 $prop_module::single_value::parse($context, i)
             }) {
                 $var = Some(value);
@@ -43,7 +38,7 @@ macro_rules! try_parse_one {
 }
 
 <%helpers:shorthand name="transition"
-                    engines="gecko servo-2013"
+                    engines="gecko servo-2013 servo-2020"
                     extra_prefixes="moz:layout.css.prefixes.transitions webkit"
                     sub_properties="transition-property transition-duration
                                     transition-timing-function
@@ -86,12 +81,12 @@ macro_rules! try_parse_one {
                 // Must check 'transition-property' after 'transition-timing-function' since
                 // 'transition-property' accepts any keyword.
                 if property.is_none() {
-                    if let Ok(value) = input.try(|i| TransitionProperty::parse(context, i)) {
+                    if let Ok(value) = input.try_parse(|i| TransitionProperty::parse(context, i)) {
                         property = Some(Some(value));
                         continue;
                     }
 
-                    if input.try(|i| i.expect_ident_matching("none")).is_ok() {
+                    if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
                         // 'none' is not a valid value for <single-transition-property>,
                         // so it's not acceptable in the function above.
                         property = Some(None);
@@ -189,13 +184,13 @@ macro_rules! try_parse_one {
 </%helpers:shorthand>
 
 <%helpers:shorthand name="animation"
-                    engines="gecko servo-2013"
+                    engines="gecko servo-2013 servo-2020"
                     extra_prefixes="moz:layout.css.prefixes.animations webkit"
                     sub_properties="animation-name animation-duration
                                     animation-timing-function animation-delay
                                     animation-iteration-count animation-direction
                                     animation-fill-mode animation-play-state"
-                    allowed_in_keyframe_block="False"
+                    rule_types_allowed="Style"
                     spec="https://drafts.csswg.org/css-animations/#propdef-animation">
     <%
         props = "name duration timing_function delay iteration_count \
@@ -311,9 +306,7 @@ ${helpers.two_properties_shorthand(
     "overscroll-behavior",
     "overscroll-behavior-x",
     "overscroll-behavior-y",
-    "specified::OverscrollBehavior::parse",
     engines="gecko",
-    needs_context=False,
     gecko_pref="layout.css.overscroll-behavior.enabled",
     spec="https://wicg.github.io/overscroll-behavior/#overscroll-behavior-properties",
 )}
@@ -390,13 +383,13 @@ ${helpers.two_properties_shorthand(
         let mut offset_rotate = None;
         loop {
             if offset_distance.is_none() {
-                if let Ok(value) = input.try(|i| LengthPercentage::parse(context, i)) {
+                if let Ok(value) = input.try_parse(|i| LengthPercentage::parse(context, i)) {
                     offset_distance = Some(value);
                 }
             }
 
             if offset_rotate.is_none() {
-                if let Ok(value) = input.try(|i| OffsetRotate::parse(context, i)) {
+                if let Ok(value) = input.try_parse(|i| OffsetRotate::parse(context, i)) {
                     offset_rotate = Some(value);
                     continue;
                 }
@@ -404,7 +397,7 @@ ${helpers.two_properties_shorthand(
             break;
         }
 
-        let offset_anchor = input.try(|i| {
+        let offset_anchor = input.try_parse(|i| {
             i.expect_delim('/')?;
             PositionOrAuto::parse(context, i)
         }).ok();
@@ -455,7 +448,7 @@ ${helpers.two_properties_shorthand(
         context: &ParserContext,
         input: &mut Parser<'i, 't>,
     ) -> Result<Longhands, ParseError<'i>> {
-        let zoom = match input.try(|input| NumberOrPercentage::parse(context, input)) {
+        let zoom = match input.try_parse(|input| NumberOrPercentage::parse(context, input)) {
             Ok(number_or_percent) => number_or_percent.to_number(),
             Err(..) => {
                 input.expect_ident_matching("normal")?;

@@ -30,11 +30,11 @@ def run_as_root(command, force=False):
     if os.geteuid() != 0:
         command.insert(0, 'sudo')
     if force:
-        command += "-y"
+        command.append('-y')
     return subprocess.call(command)
 
 
-def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, force):
+def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, pkgs_void, force):
     install = False
     pkgs = []
     if context.distro in ['Ubuntu', 'Debian GNU/Linux']:
@@ -50,20 +50,27 @@ def install_linux_deps(context, pkgs_ubuntu, pkgs_fedora, force):
             if "|{}".format(p) not in installed_pkgs:
                 install = True
                 break
+    elif context.distro == 'void':
+        installed_pkgs = str(subprocess.check_output(['xbps-query', '-l']))
+        pkgs = pkgs_void
+        for p in pkgs:
+            command = ['xbps-install', '-A']
+            if "ii {}-".format(p) not in installed_pkgs:
+                install = force = True
+                break
 
     if install:
-        if force:
-            command.append('-y')
         print("Installing missing dependencies...")
-        run_as_root(command + pkgs)
-        return True
-    return False
+        run_as_root(command + pkgs, force)
+
+    return install
 
 
 def install_salt_dependencies(context, force):
     pkgs_apt = ['build-essential', 'libssl-dev', 'libffi-dev', 'python-dev']
     pkgs_dnf = ['gcc', 'libffi-devel', 'python-devel', 'openssl-devel']
-    if not install_linux_deps(context, pkgs_apt, pkgs_dnf, force):
+    pkgs_xbps = ['gcc', 'libffi-devel', 'python-devel']
+    if not install_linux_deps(context, pkgs_apt, pkgs_dnf, pkgs_xbps, force):
         print("Dependencies are already installed")
 
 
@@ -88,6 +95,7 @@ def linux(context, force=False):
                 'libgl1-mesa-dri', 'libglib2.0-dev', 'xorg-dev', 'gperf', 'g++',
                 'build-essential', 'cmake', 'libssl-dev',
                 'liblzma-dev', 'libxmu6', 'libxmu-dev',
+                "libxcb-render0-dev", "libxcb-shape0-dev", "libxcb-xfixes0-dev",
                 'libgles2-mesa-dev', 'libegl1-mesa-dev', 'libdbus-1-dev',
                 'libharfbuzz-dev', 'ccache', 'clang', 'libunwind-dev',
                 'libgstreamer1.0-dev', 'libgstreamer-plugins-base1.0-dev',
@@ -100,11 +108,20 @@ def linux(context, force=False):
                 'rpm-build', 'openssl-devel', 'cmake',
                 'libXcursor-devel', 'libXmu-devel',
                 'dbus-devel', 'ncurses-devel', 'harfbuzz-devel', 'ccache',
-                'clang', 'clang-libs', 'autoconf213', 'python3-devel',
+                'clang', 'clang-libs', 'llvm', 'autoconf213', 'python3-devel',
                 'gstreamer1-devel', 'gstreamer1-plugins-base-devel',
                 'gstreamer1-plugins-bad-free-devel']
+    pkgs_xbps = ['libtool', 'gcc', 'libXi-devel', 'freetype-devel',
+                 'libunwind-devel', 'MesaLib-devel', 'glib-devel', 'pkg-config',
+                 'libX11-devel', 'libXrandr-devel', 'gperf', 'bzip2-devel',
+                 'fontconfig-devel', 'cabextract', 'expat-devel', 'cmake',
+                 'cmake', 'libXcursor-devel', 'libXmu-devel', 'dbus-devel',
+                 'ncurses-devel', 'harfbuzz-devel', 'ccache', 'glu-devel',
+                 'clang', 'gstreamer1-devel', 'autoconf213',
+                 'gst-plugins-base1-devel', 'gst-plugins-bad1-devel']
 
-    installed_something = install_linux_deps(context, pkgs_apt, pkgs_dnf, force)
+    installed_something = install_linux_deps(context, pkgs_apt, pkgs_dnf,
+                                             pkgs_xbps, force)
 
     if not check_gstreamer_lib():
         installed_something |= gstreamer(context, force)
@@ -243,7 +260,7 @@ def windows_msvc(context, force=False):
     '''Bootstrapper for MSVC building on Windows.'''
 
     deps_dir = os.path.join(context.sharedir, "msvc-dependencies")
-    deps_url = "https://servo-deps.s3.amazonaws.com/msvc-deps/"
+    deps_url = "https://servo-deps-2.s3.amazonaws.com/msvc-deps/"
 
     def version(package):
         return packages.WINDOWS_MSVC[package]
@@ -255,7 +272,8 @@ def windows_msvc(context, force=False):
         cmake_path = find_executable("cmake")
         if cmake_path:
             cmake = subprocess.Popen([cmake_path, "--version"], stdout=PIPE)
-            cmake_version = cmake.stdout.read().splitlines()[0].replace("cmake version ", "")
+            cmake_version_output = six.ensure_str(cmake.stdout.read()).splitlines()[0]
+            cmake_version = cmake_version_output.replace("cmake version ", "")
             if LooseVersion(cmake_version) >= LooseVersion(version):
                 return True
         return False
@@ -315,13 +333,15 @@ def get_linux_distribution():
     distrib = six.ensure_str(distrib)
     version = six.ensure_str(version)
 
-    if distrib == 'LinuxMint' or distrib == 'Linux Mint':
+    if distrib in ['LinuxMint', 'Linux Mint', 'KDE neon']:
         if '.' in version:
             major, _ = version.split('.', 1)
         else:
             major = version
 
-        if major == '19':
+        if major == '20':
+            base_version = '20.04'
+        elif major == '19':
             base_version = '18.04'
         elif major == '18':
             base_version = '16.04'
@@ -335,7 +355,9 @@ def get_linux_distribution():
         else:
             major = version
 
-        if major == '19':
+        if major == '20':
+            base_version = '20.04'
+        elif major == '19':
             base_version = '18.04'
         elif major == '18':
             base_version = '16.04'
@@ -352,7 +374,7 @@ def get_linux_distribution():
             raise Exception('unsupported version of %s: %s' % (distrib, version))
         distrib, version = 'Ubuntu', base_version
     elif distrib.lower() == 'ubuntu':
-        if version > '20.04':
+        if version > '21.04':
             raise Exception('unsupported version of %s: %s' % (distrib, version))
     # Fixme: we should allow checked/supported versions only
     elif distrib.lower() not in [
@@ -360,6 +382,8 @@ def get_linux_distribution():
         'centos linux',
         'debian gnu/linux',
         'fedora',
+        'void',
+        'nixos',
     ]:
         raise Exception('mach bootstrap does not support %s, please file a bug' % distrib)
 
@@ -374,6 +398,15 @@ def bootstrap(context, force=False, specific=None):
         bootstrapper = windows_msvc
     elif "linux-gnu" in host_triple():
         distrib, version = get_linux_distribution()
+
+        if distrib.lower() == 'nixos':
+            print('NixOS does not need bootstrap, it will automatically enter a nix-shell')
+            print('Just run ./mach build')
+            print('')
+            print('You will need to run a nix-shell if you are trying to run any of the built binaries')
+            print('To enter the nix-shell manually use:')
+            print('  $ nix-shell etc/shell.nix')
+            return
 
         context.distro = distrib
         context.distro_version = version

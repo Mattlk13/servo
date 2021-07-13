@@ -26,7 +26,6 @@ use surfman::SurfaceAccess;
 use surfman::SurfaceInfo;
 use surfman::SurfaceTexture;
 use surfman::SurfaceType;
-use surfman_chains::SurfmanProvider;
 use surfman_chains::SwapChain;
 
 /// A bridge between webrender and surfman
@@ -68,7 +67,7 @@ impl WebrenderSurfman {
         };
         let context_attributes = ContextAttributes { flags, version };
         let context_descriptor = device.create_context_descriptor(&context_attributes)?;
-        let mut context = device.create_context(&context_descriptor)?;
+        let mut context = device.create_context(&context_descriptor, None)?;
         let surface_access = SurfaceAccess::GPUOnly;
         let headless = match surface_type {
             SurfaceType::Widget { .. } => false,
@@ -81,12 +80,14 @@ impl WebrenderSurfman {
                 let _ = device.destroy_surface(&mut context, &mut surface);
                 err
             })?;
+
+        device.make_context_current(&context)?;
+
         let swap_chain = if headless {
-            let surface_provider = Box::new(SurfmanProvider::new(surface_access));
             Some(SwapChain::create_attached(
                 &mut device,
                 &mut context,
-                surface_provider,
+                surface_access,
             )?)
         } else {
             None
@@ -149,7 +150,7 @@ impl WebrenderSurfman {
         let ref mut device = self.0.device.borrow_mut();
         let ref mut context = self.0.context.borrow_mut();
         if let Some(ref swap_chain) = self.0.swap_chain {
-            return swap_chain.swap_buffers(device, context);
+            return swap_chain.swap_buffers(device, context, surfman_chains::PreserveBuffer::No);
         }
         let mut surface = device.unbind_surface_from_context(context)?.unwrap();
         device.present_surface(context, &mut surface)?;
@@ -159,6 +160,23 @@ impl WebrenderSurfman {
                 let _ = device.destroy_surface(context, &mut surface);
                 err
             })
+    }
+
+    /// Invoke a closure with the surface associated with the current front buffer.
+    /// This can be used to create a surfman::SurfaceTexture to blit elsewhere.
+    pub fn with_front_buffer<F: FnMut(&Device, Surface) -> Surface>(&self, mut f: F) {
+        let ref mut device = self.0.device.borrow_mut();
+        let ref mut context = self.0.context.borrow_mut();
+        let surface = device
+            .unbind_surface_from_context(context)
+            .unwrap()
+            .unwrap();
+        let surface = f(device, surface);
+        device.bind_surface_to_context(context, surface).unwrap();
+    }
+
+    pub fn device(&self) -> std::cell::Ref<Device> {
+        self.0.device.borrow()
     }
 
     pub fn connection(&self) -> Connection {

@@ -56,12 +56,12 @@ use js::glue::{IsWrapper, UnwrapObjectDynamic};
 use js::glue::{RUST_JSID_IS_INT, RUST_JSID_TO_INT};
 use js::glue::{RUST_JSID_IS_STRING, RUST_JSID_TO_STRING};
 use js::jsapi::{Heap, JSContext, JSObject, JSString};
-use js::jsapi::{IsWindowProxy, JS_NewStringCopyN, JS_StringHasLatin1Chars};
+use js::jsapi::{IsWindowProxy, JS_DeprecatedStringHasLatin1Chars, JS_NewStringCopyN};
 use js::jsapi::{
     JS_GetLatin1StringCharsAndLength, JS_GetTwoByteStringCharsAndLength, JS_IsExceptionPending,
 };
 use js::jsval::{ObjectValue, StringValue, UndefinedValue};
-use js::rust::wrappers::{JS_GetProperty, JS_HasProperty, JS_IsArrayObject};
+use js::rust::wrappers::{IsArrayObject, JS_GetProperty, JS_HasProperty};
 use js::rust::{get_object_class, is_dom_class, is_dom_object, maybe_wrap_value, ToString};
 use js::rust::{HandleId, HandleObject, HandleValue, MutableHandleValue};
 use num_traits::Float;
@@ -220,7 +220,7 @@ impl FromJSValConvertible for DOMString {
 /// Convert the given `JSString` to a `DOMString`. Fails if the string does not
 /// contain valid UTF-16.
 pub unsafe fn jsstring_to_str(cx: *mut JSContext, s: *mut JSString) -> DOMString {
-    let latin1 = JS_StringHasLatin1Chars(s);
+    let latin1 = JS_DeprecatedStringHasLatin1Chars(s);
     DOMString::from_string(if latin1 {
         latin1_to_string(cx, s)
     } else {
@@ -271,7 +271,7 @@ impl FromJSValConvertible for USVString {
             debug!("ToString failed");
             return Err(());
         }
-        let latin1 = JS_StringHasLatin1Chars(jsstr);
+        let latin1 = JS_DeprecatedStringHasLatin1Chars(jsstr);
         if latin1 {
             // FIXME(ajeffrey): Convert directly from DOMString to USVString
             return Ok(ConversionResult::Success(USVString(String::from(
@@ -317,7 +317,7 @@ impl FromJSValConvertible for ByteString {
             return Err(());
         }
 
-        let latin1 = JS_StringHasLatin1Chars(string);
+        let latin1 = JS_DeprecatedStringHasLatin1Chars(string);
         if latin1 {
             let mut length = 0;
             let chars = JS_GetLatin1StringCharsAndLength(cx, ptr::null(), string, &mut length);
@@ -404,6 +404,11 @@ pub unsafe fn get_dom_class(obj: *mut JSObject) -> Result<&'static DOMClass, ()>
     Err(())
 }
 
+pub(crate) enum PrototypeCheck {
+    Derive(fn(&'static DOMClass) -> bool),
+    Depth { depth: usize, proto_id: u16 },
+}
+
 /// Get a `*const libc::c_void` for the given DOM object, unwrapping any
 /// wrapper around it first, and checking if the object is of the correct type.
 ///
@@ -411,14 +416,11 @@ pub unsafe fn get_dom_class(obj: *mut JSObject) -> Result<&'static DOMClass, ()>
 /// not an object for a DOM object of the given type (as defined by the
 /// proto_id and proto_depth).
 #[inline]
-pub unsafe fn private_from_proto_check<F>(
+pub(crate) unsafe fn private_from_proto_check(
     mut obj: *mut JSObject,
     cx: *mut JSContext,
-    proto_check: F,
-) -> Result<*const libc::c_void, ()>
-where
-    F: Fn(&'static DOMClass) -> bool,
-{
+    proto_check: PrototypeCheck,
+) -> Result<*const libc::c_void, ()> {
     let dom_class = get_dom_class(obj).or_else(|_| {
         if IsWrapper(obj) {
             trace!("found wrapper");
@@ -437,7 +439,14 @@ where
         }
     })?;
 
-    if proto_check(dom_class) {
+    let prototype_matches = match proto_check {
+        PrototypeCheck::Derive(f) => (f)(dom_class),
+        PrototypeCheck::Depth { depth, proto_id } => {
+            dom_class.interface_chain[depth] as u16 == proto_id
+        },
+    };
+
+    if prototype_matches {
         trace!("good prototype");
         Ok(private_from_object(obj))
     } else {
@@ -452,13 +461,10 @@ where
 /// Returns Err(()) if `obj` is a wrapper or if the object is not an object
 /// for a DOM object of the given type (as defined by the proto_id and proto_depth).
 #[inline]
-pub unsafe fn private_from_proto_check_static<F>(
+unsafe fn private_from_proto_check_static(
     obj: *mut JSObject,
-    proto_check: F,
-) -> Result<*const libc::c_void, ()>
-where
-    F: Fn(&'static DOMClass) -> bool,
-{
+    proto_check: fn(&'static DOMClass) -> bool,
+) -> Result<*const libc::c_void, ()> {
     let dom_class = get_dom_class(obj).map_err(|_| ())?;
     if proto_check(dom_class) {
         trace!("good prototype");
@@ -474,7 +480,10 @@ pub fn native_from_object<T>(obj: *mut JSObject, cx: *mut JSContext) -> Result<*
 where
     T: DomObject + IDLInterface,
 {
-    unsafe { private_from_proto_check(obj, cx, T::derives).map(|ptr| ptr as *const T) }
+    unsafe {
+        private_from_proto_check(obj, cx, PrototypeCheck::Derive(T::derives))
+            .map(|ptr| ptr as *const T)
+    }
 }
 
 /// Get a `*const T` for a DOM object accessible from a `JSObject`, where the DOM object
@@ -555,7 +564,7 @@ impl<T: DomObject> ToJSValConvertible for DomRoot<T> {
 /// NodeList).
 pub unsafe fn is_array_like(cx: *mut JSContext, value: HandleValue) -> bool {
     let mut is_array = false;
-    assert!(JS_IsArrayObject(cx, value, &mut is_array));
+    assert!(IsArrayObject(cx, value, &mut is_array));
     if is_array {
         return true;
     }

@@ -5,8 +5,6 @@ import inspect
 import os
 import re
 
-import six
-
 MYPY = False
 if MYPY:
     # MYPY is set to True when run under Mypy.
@@ -19,7 +17,7 @@ def collapse(text):
     return inspect.cleandoc(str(text)).replace("\n", " ")
 
 
-class Rule(six.with_metaclass(abc.ABCMeta)):
+class Rule(metaclass=abc.ABCMeta):
     @abc.abstractproperty
     def name(self):
         # type: () -> Text
@@ -79,6 +77,18 @@ class WorkerCollision(Rule):
 class GitIgnoreFile(Rule):
     name = "GITIGNORE"
     description = ".gitignore found outside the root"
+
+
+class MojomJSFile(Rule):
+    name = "MOJOM-JS"
+    description = "Don't check *.mojom.js files into WPT"
+    to_fix = """
+        Check if the file is already included in mojojs.zip:
+        https://source.chromium.org/chromium/chromium/src/+/master:chrome/tools/build/linux/FILES.cfg
+        If yes, use `loadMojoResources` from `resources/test-only-api.js` to load
+        it; if not, contact ecosystem-infra@chromium.org for adding new files
+        to mojojs.zip.
+    """
 
 
 class AhemCopy(Rule):
@@ -185,6 +195,14 @@ class MultipleTestharness(Rule):
     """
 
 
+class MissingReftestWait(Rule):
+    name = "MISSING-REFTESTWAIT"
+    description = "Missing `class=reftest-wait`"
+    to_fix = """
+        ensure tests that include reftest-wait.js also use class=reftest-wait on the root element.
+    """
+
+
 class MissingTestharnessReport(Rule):
     name = "MISSING-TESTHARNESSREPORT"
     description = "Missing `<script src='/resources/testharnessreport.js'>`"
@@ -238,6 +256,16 @@ class EarlyTestharnessReport(Rule):
         Test file has an instance of
         `<script src='/resources/testharnessreport.js'>` prior to
         `<script src='/resources/testharness.js'>`
+    """)
+    to_fix = "flip the order"
+
+
+class EarlyTestdriverVendor(Rule):
+    name = "EARLY-TESTDRIVER-VENDOR"
+    description = collapse("""
+        Test file has an instance of
+        `<script src='/resources/testdriver-vendor.js'>` prior to
+        `<script src='/resources/testdriver.js'>`
     """)
     to_fix = "flip the order"
 
@@ -322,7 +350,22 @@ class TestharnessInOtherType(Rule):
     description = "testharness.js included in a %s test"
 
 
-class Regexp(six.with_metaclass(abc.ABCMeta)):
+class DuplicateBasenamePath(Rule):
+    name = "DUPLICATE-BASENAME-PATH"
+    description = collapse("""
+            File has identical basename path (path excluding extension) as
+            other file(s) (found extensions: %s)
+    """)
+    to_fix = "rename files so they have unique basename paths"
+
+
+class TentativeDirectoryName(Rule):
+    name = "TENTATIVE-DIRECTORY-NAME"
+    description = "Directories for tentative tests must be named exactly 'tentative'"
+    to_fix = "rename directory to be called 'tentative'"
+
+
+class Regexp(metaclass=abc.ABCMeta):
     @abc.abstractproperty
     def pattern(self):
         # type: () -> bytes
@@ -345,7 +388,7 @@ class Regexp(six.with_metaclass(abc.ABCMeta)):
         self._re = re.compile(self.pattern)  # type: Pattern[bytes]
 
     def applies(self, path):
-        # type: (str) -> bool
+        # type: (Text) -> bool
         return (self.file_extensions is None or
                 os.path.splitext(path)[1] in self.file_extensions)
 
@@ -395,6 +438,11 @@ class WebPlatformTestRegexp(Regexp):
     pattern = br"web\-platform\.test"
     name = "WEB-PLATFORM.TEST"
     description = "Internal web-platform.test domain used"
+    to_fix = """
+        use [server-side substitution](https://web-platform-tests.org/writing-tests/server-pipes.html#sub),
+        along with the [`.sub` filename-flag](https://web-platform-tests.org/writing-tests/file-names.html#test-features),
+        to replace web-platform.test with `{{domains[]}}`
+    """
 
 
 class Webidl2Regexp(Regexp):

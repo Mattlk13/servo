@@ -7,12 +7,13 @@
 //!
 //! [position]: https://drafts.csswg.org/css-backgrounds-3/#position
 
-use crate::values::computed::{Integer, LengthPercentage, Percentage};
+use crate::values::computed::{Integer, LengthPercentage, NonNegativeNumber, Percentage};
+use crate::values::generics::position::AspectRatio as GenericAspectRatio;
 use crate::values::generics::position::Position as GenericPosition;
 use crate::values::generics::position::PositionComponent as GenericPositionComponent;
 use crate::values::generics::position::PositionOrAuto as GenericPositionOrAuto;
 use crate::values::generics::position::ZIndex as GenericZIndex;
-pub use crate::values::specified::position::{GridAutoFlow, GridTemplateAreas};
+pub use crate::values::specified::position::{GridAutoFlow, GridTemplateAreas, MasonryAutoFlow};
 use crate::Zero;
 use std::fmt::{self, Write};
 use style_traits::{CssWriter, ToCss};
@@ -68,3 +69,6 @@ impl GenericPositionComponent for LengthPercentage {
 
 /// A computed value for the `z-index` property.
 pub type ZIndex = GenericZIndex<Integer>;
+
+/// A computed value for the `aspect-ratio` property.
+pub type AspectRatio = GenericAspectRatio<NonNegativeNumber>;

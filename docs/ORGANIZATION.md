@@ -63,7 +63,7 @@
 * mach
   * A command-line tool to help with developer tasks.
 * ports
-  * glutin
+  * winit
     * Embedding implementation for the `winit` windowing library.
 * python
   * servo
@@ -87,8 +87,6 @@
 * tests
   * dromaeo
     * Harness for automatically running the Dromaeo testsuite.
-  * heartbeats
-    * Tools for periodic measurement of energy consumption.
   * html
     * Manual tests and experiments.
   * jquery

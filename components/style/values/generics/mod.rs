@@ -11,8 +11,7 @@ use crate::parser::{Parse, ParserContext};
 use crate::Zero;
 use cssparser::Parser;
 use std::ops::Add;
-use style_traits::{KeywordsCollectFn, ParseError};
-use style_traits::{SpecifiedValueInfo, StyleParseErrorKind};
+use style_traits::{KeywordsCollectFn, ParseError, SpecifiedValueInfo, StyleParseErrorKind};
 
 pub mod background;
 pub mod basic_shape;
@@ -31,7 +30,9 @@ pub mod grid;
 pub mod image;
 pub mod length;
 pub mod motion;
+pub mod page;
 pub mod position;
+pub mod ratio;
 pub mod rect;
 pub mod size;
 pub mod svg;
@@ -101,13 +102,13 @@ impl Parse for CounterStyle {
         context: &ParserContext,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self, ParseError<'i>> {
-        if let Ok(name) = input.try(|i| parse_counter_style_name(i)) {
+        if let Ok(name) = input.try_parse(|i| parse_counter_style_name(i)) {
             return Ok(CounterStyle::Name(name));
         }
         input.expect_function_matching("symbols")?;
         input.parse_nested_block(|input| {
             let symbols_type = input
-                .try(SymbolsType::parse)
+                .try_parse(SymbolsType::parse)
                 .unwrap_or(SymbolsType::Symbolic);
             let symbols = Symbols::parse(context, input)?;
             // There must be at least two symbols for alphabetic or
@@ -292,3 +293,5 @@ impl<L> ClipRectOrAuto<L> {
         matches!(*self, ClipRectOrAuto::Auto)
     }
 }
+
+pub use page::PageSize;

@@ -5,6 +5,9 @@
 //! Generic types for CSS handling of specified and computed values of
 //! [`position`](https://drafts.csswg.org/css-backgrounds-3/#position)
 
+use crate::values::animated::ToAnimatedZero;
+use crate::values::generics::ratio::Ratio;
+
 /// A generic type for representing a CSS [position](https://drafts.csswg.org/css-values/#position).
 #[derive(
     Animate,
@@ -148,5 +151,82 @@ impl<Integer> ZIndex<Integer> {
             ZIndex::Integer(n) => n,
             ZIndex::Auto => auto,
         }
+    }
+}
+
+/// Ratio or None.
+#[derive(
+    Animate,
+    Clone,
+    ComputeSquaredDistance,
+    Copy,
+    Debug,
+    MallocSizeOf,
+    PartialEq,
+    SpecifiedValueInfo,
+    ToComputedValue,
+    ToCss,
+    ToResolvedValue,
+    ToShmem,
+)]
+#[repr(C, u8)]
+pub enum PreferredRatio<N> {
+    /// Without specified ratio
+    #[css(skip)]
+    None,
+    /// With specified ratio
+    Ratio(
+        #[animation(field_bound)]
+        #[css(field_bound)]
+        #[distance(field_bound)]
+        Ratio<N>,
+    ),
+}
+
+/// A generic value for the `aspect-ratio` property, the value is `auto || <ratio>`.
+#[derive(
+    Animate,
+    Clone,
+    ComputeSquaredDistance,
+    Copy,
+    Debug,
+    MallocSizeOf,
+    PartialEq,
+    SpecifiedValueInfo,
+    ToComputedValue,
+    ToCss,
+    ToResolvedValue,
+    ToShmem,
+)]
+#[repr(C)]
+pub struct GenericAspectRatio<N> {
+    /// Specifiy auto or not.
+    #[animation(constant)]
+    #[css(represents_keyword)]
+    pub auto: bool,
+    /// The preferred aspect-ratio value.
+    #[animation(field_bound)]
+    #[css(field_bound)]
+    #[distance(field_bound)]
+    pub ratio: PreferredRatio<N>,
+}
+
+pub use self::GenericAspectRatio as AspectRatio;
+
+impl<N> AspectRatio<N> {
+    /// Returns `auto`
+    #[inline]
+    pub fn auto() -> Self {
+        AspectRatio {
+            auto: true,
+            ratio: PreferredRatio::None,
+        }
+    }
+}
+
+impl<N> ToAnimatedZero for AspectRatio<N> {
+    #[inline]
+    fn to_animated_zero(&self) -> Result<Self, ()> {
+        Err(())
     }
 }

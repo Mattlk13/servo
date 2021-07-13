@@ -4,8 +4,9 @@
 
 use crate::data_loader::decode;
 use crate::fetch::cors_cache::CorsCache;
+use crate::fetch::headers::determine_nosniff;
 use crate::filemanager_thread::{FileManager, FILE_CHUNK_SIZE};
-use crate::http_loader::{determine_request_referrer, http_fetch, HttpState};
+use crate::http_loader::{determine_requests_referrer, http_fetch, HttpState};
 use crate::http_loader::{set_default_accept, set_default_accept_language};
 use crate::subresource_integrity::is_response_integrity_valid;
 use content_security_policy as csp;
@@ -15,17 +16,20 @@ use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt, Range};
 use http::header::{self, HeaderMap, HeaderName};
 use hyper::Method;
 use hyper::StatusCode;
-use ipc_channel::ipc::IpcReceiver;
+use ipc_channel::ipc::{self, IpcReceiver};
 use mime::{self, Mime};
 use net_traits::blob_url_store::{parse_blob_url, BlobURLStoreError};
 use net_traits::filemanager_thread::{FileTokenCheck, RelativePos};
 use net_traits::request::{
     is_cors_safelisted_method, is_cors_safelisted_request_header, Origin, ResponseTainting, Window,
 };
-use net_traits::request::{CredentialsMode, Destination, Referrer, Request, RequestMode};
+use net_traits::request::{
+    BodyChunkRequest, BodyChunkResponse, CredentialsMode, Destination, Referrer, Request,
+    RequestMode,
+};
 use net_traits::response::{Response, ResponseBody, ResponseType};
 use net_traits::{FetchTaskTarget, NetworkError, ReferrerPolicy, ResourceFetchTiming};
-use net_traits::{ResourceAttribute, ResourceTimeValue};
+use net_traits::{ResourceAttribute, ResourceTimeValue, ResourceTimingType};
 use servo_arc::Arc as ServoArc;
 use servo_url::ServoUrl;
 use std::borrow::Cow;
@@ -233,30 +237,19 @@ pub fn main_fetch(
         .or(Some(ReferrerPolicy::NoReferrerWhenDowngrade));
 
     // Step 8.
-    {
-        let referrer_url = match mem::replace(&mut request.referrer, Referrer::NoReferrer) {
-            Referrer::NoReferrer => None,
-            Referrer::Client => {
-                // FIXME(#14507): We should never get this value here; it should
-                //                already have been handled in the script thread.
-                request.headers.remove(header::REFERER);
-                None
-            },
-            Referrer::ReferrerUrl(url) => {
-                request.headers.remove(header::REFERER);
-                let current_url = request.current_url();
-                determine_request_referrer(
-                    &mut request.headers,
-                    request.referrer_policy.unwrap(),
-                    url,
-                    current_url,
-                )
-            },
-        };
-        if let Some(referrer_url) = referrer_url {
-            request.referrer = Referrer::ReferrerUrl(referrer_url);
-        }
-    }
+    assert!(request.referrer_policy.is_some());
+    let referrer_url = match mem::replace(&mut request.referrer, Referrer::NoReferrer) {
+        Referrer::NoReferrer => None,
+        Referrer::ReferrerUrl(referrer_source) | Referrer::Client(referrer_source) => {
+            request.headers.remove(header::REFERER);
+            determine_requests_referrer(
+                request.referrer_policy.unwrap(),
+                referrer_source,
+                request.current_url(),
+            )
+        },
+    };
+    request.referrer = referrer_url.map_or(Referrer::NoReferrer, |url| Referrer::ReferrerUrl(url));
 
     // Step 9.
     // TODO: handle FTP URLs.
@@ -281,7 +274,10 @@ pub fn main_fetch(
             false
         };
 
-        if (same_origin && !cors_flag) || current_url.scheme() == "data" {
+        if (same_origin && !cors_flag) ||
+            current_url.scheme() == "data" ||
+            current_url.scheme() == "chrome"
+        {
             // Substep 1.
             request.response_tainting = ResponseTainting::Basic;
 
@@ -605,6 +601,17 @@ fn range_not_satisfiable_error(response: &mut Response) {
     response.raw_status = Some((StatusCode::RANGE_NOT_SATISFIABLE.as_u16(), reason.into()));
 }
 
+fn create_blank_reply(url: ServoUrl, timing_type: ResourceTimingType) -> Response {
+    let mut response = Response::new(url, ResourceFetchTiming::new(timing_type));
+    response
+        .headers
+        .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
+    *response.body.lock().unwrap() = ResponseBody::Done(vec![]);
+    response.status = Some((StatusCode::OK, "OK".to_string()));
+    response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
+    response
+}
+
 /// [Scheme fetch](https://fetch.spec.whatwg.org#scheme-fetch)
 fn scheme_fetch(
     request: &mut Request,
@@ -616,15 +623,34 @@ fn scheme_fetch(
     let url = request.current_url();
 
     match url.scheme() {
-        "about" if url.path() == "blank" => {
-            let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-            response
-                .headers
-                .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
-            *response.body.lock().unwrap() = ResponseBody::Done(vec![]);
-            response.status = Some((StatusCode::OK, "OK".to_string()));
-            response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
-            response
+        "about" if url.path() == "blank" => create_blank_reply(url, request.timing_type()),
+
+        "chrome" if url.path() == "allowcert" => {
+            let data = request.body.as_mut().and_then(|body| {
+                let stream = body.take_stream();
+                let (body_chan, body_port) = ipc::channel().unwrap();
+                let _ = stream.send(BodyChunkRequest::Connect(body_chan));
+                let _ = stream.send(BodyChunkRequest::Chunk);
+                match body_port.recv().ok() {
+                    Some(BodyChunkResponse::Chunk(bytes)) => Some(bytes),
+                    _ => panic!("cert should be sent in a single chunk."),
+                }
+            });
+            let data = data.as_ref().and_then(|b| {
+                let idx = b.iter().position(|b| *b == b'&')?;
+                Some(b.split_at(idx))
+            });
+
+            if let Some((secret, bytes)) = data {
+                let secret = str::from_utf8(secret).ok().and_then(|s| s.parse().ok());
+                if secret == Some(*net_traits::PRIVILEGED_SECRET) {
+                    if let Ok(bytes) = base64::decode(&bytes[1..]) {
+                        context.state.extra_certs.add(bytes);
+                    }
+                }
+            }
+
+            create_blank_reply(url, request.timing_type())
         },
 
         "http" | "https" => http_fetch(
@@ -809,18 +835,12 @@ pub fn should_be_blocked_due_to_nosniff(
     destination: Destination,
     response_headers: &HeaderMap,
 ) -> bool {
-    // Steps 1-3.
-    // TODO(eijebong): Replace this once typed headers allow custom ones...
-    if response_headers
-        .get("x-content-type-options")
-        .map_or(true, |val| {
-            val.to_str().unwrap_or("").to_lowercase() != "nosniff"
-        })
-    {
+    // Step 1
+    if !determine_nosniff(response_headers) {
         return false;
     }
 
-    // Step 4
+    // Step 2
     // Note: an invalid MIME type will produce a `None`.
     let content_type_header = response_headers.typed_get::<ContentType>();
 
@@ -852,19 +872,19 @@ pub fn should_be_blocked_due_to_nosniff(
     }
 
     match content_type_header {
-        // Step 6
+        // Step 4
         Some(ref ct) if destination.is_script_like() => {
             !is_javascript_mime_type(&ct.clone().into())
         },
 
-        // Step 7
+        // Step 5
         Some(ref ct) if destination == Destination::Style => {
             let m: mime::Mime = ct.clone().into();
             m.type_() != mime::TEXT && m.subtype() != mime::CSS
         },
 
         None if destination == Destination::Style || destination.is_script_like() => true,
-        // Step 8
+        // Step 6
         _ => false,
     }
 }
@@ -928,11 +948,12 @@ fn is_network_scheme(scheme: &str) -> bool {
 
 /// <https://fetch.spec.whatwg.org/#bad-port>
 fn is_bad_port(port: u16) -> bool {
-    static BAD_PORTS: [u16; 64] = [
-        1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 77, 79, 87, 95, 101, 102,
-        103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 139, 143, 179, 389, 465, 512, 513,
-        514, 515, 526, 530, 531, 532, 540, 556, 563, 587, 601, 636, 993, 995, 2049, 3659, 4045,
-        6000, 6665, 6666, 6667, 6668, 6669,
+    static BAD_PORTS: [u16; 78] = [
+        1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101,
+        102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389,
+        427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636,
+        993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667,
+        6668, 6669, 6697, 10080,
     ];
 
     BAD_PORTS.binary_search(&port).is_ok()

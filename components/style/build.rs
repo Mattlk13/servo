@@ -4,15 +4,6 @@
 
 #[macro_use]
 extern crate lazy_static;
-#[cfg(feature = "gecko")]
-extern crate bindgen;
-#[cfg(feature = "gecko")]
-extern crate log;
-#[cfg(feature = "gecko")]
-extern crate regex;
-#[cfg(feature = "gecko")]
-extern crate toml;
-extern crate walkdir;
 
 use std::env;
 use std::path::Path;
@@ -30,7 +21,7 @@ mod build_gecko {
 lazy_static! {
     pub static ref PYTHON: String = env::var("PYTHON3").ok().unwrap_or_else(|| {
         let candidates = if cfg!(windows) {
-            ["python3.exe"]
+            ["python.exe"]
         } else {
             ["python3"]
         };

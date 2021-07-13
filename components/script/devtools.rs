@@ -14,16 +14,18 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::AnimationFrameCallback;
 use crate::dom::element::Element;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::htmlscriptelement::SourceCode;
 use crate::dom::node::{window_from_node, Node, ShadowIncluding};
 use crate::realms::enter_realm;
+use crate::script_module::ScriptFetchOptions;
 use crate::script_thread::Documents;
 use devtools_traits::{AutoMargins, ComputedNodeLayout, TimelineMarkerType};
 use devtools_traits::{EvaluateJSReply, Modification, NodeInfo, TimelineMarker};
 use ipc_channel::ipc::IpcSender;
 use js::jsval::UndefinedValue;
-use js::rust::wrappers::ObjectClassName;
+use js::rust::ToString;
 use msg::constellation_msg::PipelineId;
-use std::ffi::CStr;
+use std::rc::Rc;
 use std::str;
 use uuid::Uuid;
 
@@ -34,7 +36,15 @@ pub fn handle_evaluate_js(global: &GlobalScope, eval: String, reply: IpcSender<E
         let cx = global.get_cx();
         let _ac = enter_realm(global);
         rooted!(in(*cx) let mut rval = UndefinedValue());
-        global.evaluate_script_on_global_with_result(&eval, "<eval>", rval.handle_mut(), 1);
+        let source_code = SourceCode::Text(Rc::new(DOMString::from_string(eval)));
+        global.evaluate_script_on_global_with_result(
+            &source_code,
+            "<eval>",
+            rval.handle_mut(),
+            1,
+            ScriptFetchOptions::default_classic_script(&global),
+            global.api_base_url(),
+        );
 
         if rval.is_undefined() {
             EvaluateJSReply::VoidValue
@@ -54,12 +64,11 @@ pub fn handle_evaluate_js(global: &GlobalScope, eval: String, reply: IpcSender<E
         } else {
             assert!(rval.is_object());
 
-            rooted!(in(*cx) let obj = rval.to_object());
-            let class_name = CStr::from_ptr(ObjectClassName(*cx, obj.handle()));
-            let class_name = str::from_utf8(class_name.to_bytes()).unwrap();
+            let jsstr = ToString(*cx, rval.handle());
+            let class_name = jsstring_to_str(*cx, jsstr);
 
             EvaluateJSReply::ActorValue {
-                class: class_name.to_owned(),
+                class: class_name.to_string(),
                 uuid: Uuid::new_v4().to_string(),
             }
         }

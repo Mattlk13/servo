@@ -4,19 +4,19 @@
 
 use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
 use crate::actors::timeline::HighResolutionStamp;
+use crate::StreamId;
 use devtools_traits::DevtoolScriptControlMsg;
 use ipc_channel::ipc::IpcSender;
 use msg::constellation_msg::PipelineId;
 use serde_json::{Map, Value};
 use std::mem;
 use std::net::TcpStream;
-use time::precise_time_ns;
 
 pub struct FramerateActor {
     name: String,
     pipeline: PipelineId,
     script_sender: IpcSender<DevtoolScriptControlMsg>,
-    start_time: Option<u64>,
+
     is_recording: bool,
     ticks: Vec<HighResolutionStamp>,
 }
@@ -32,6 +32,7 @@ impl Actor for FramerateActor {
         _msg_type: &str,
         _msg: &Map<String, Value>,
         _stream: &mut TcpStream,
+        _id: StreamId,
     ) -> Result<ActorMessageStatus, ()> {
         Ok(ActorMessageStatus::Ignored)
     }
@@ -49,7 +50,6 @@ impl FramerateActor {
             name: actor_name.clone(),
             pipeline: pipeline_id,
             script_sender: script_sender,
-            start_time: None,
             is_recording: false,
             ticks: Vec::new(),
         };
@@ -77,7 +77,6 @@ impl FramerateActor {
             return;
         }
 
-        self.start_time = Some(precise_time_ns());
         self.is_recording = true;
 
         let msg = DevtoolScriptControlMsg::RequestAnimationFrame(self.pipeline, self.name());
@@ -89,7 +88,6 @@ impl FramerateActor {
             return;
         }
         self.is_recording = false;
-        self.start_time = None;
     }
 }
 

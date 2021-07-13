@@ -25,6 +25,7 @@ use style::properties::{
 };
 use style::selector_parser::PseudoElement;
 use style::shared_lock::Locked;
+use style::stylesheets::{CssRuleType, Origin};
 use style_traits::ParsingMode;
 
 // http://dev.w3.org/csswg/cssom/#the-cssstyledeclaration-interface
@@ -113,8 +114,10 @@ impl CSSStyleOwner {
                 if changed {
                     // If this is changed, see also
                     // CSSStyleRule::SetSelectorText, which does the same thing.
-                    stylesheets_owner_from_node(rule.parent_stylesheet().owner().upcast::<Node>())
-                        .invalidate_stylesheets();
+                    if let Some(owner) = rule.parent_stylesheet().get_owner() {
+                        stylesheets_owner_from_node(owner.upcast::<Node>())
+                            .invalidate_stylesheets();
+                    }
                 }
                 result
             },
@@ -300,10 +303,12 @@ impl CSSStyleDeclaration {
                 &mut declarations,
                 id,
                 &value,
+                Origin::Author,
                 &self.owner.base_url(),
                 window.css_error_reporter(),
                 ParsingMode::DEFAULT,
                 quirks_mode,
+                CssRuleType::Style,
             );
 
             // Step 6
@@ -459,6 +464,7 @@ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
                 &self.owner.base_url(),
                 window.css_error_reporter(),
                 quirks_mode,
+                CssRuleType::Style,
             );
         });
 

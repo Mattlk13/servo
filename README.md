@@ -54,9 +54,12 @@ Please select your operating system:
 
 Xcode version 10.2 or above is recommended.
 
-##### On macOS (Homebrew)
+##### On macOS(Intel based or ARM based) (Homebrew)
+
+NOTE: run these steps after you've cloned the project locally.
 
 ``` sh
+cd servo 
 brew bundle install --file=etc/taskcluster/macos/Brewfile
 brew bundle install --file=etc/taskcluster/macos/Brewfile-build
 pip install virtualenv
@@ -65,7 +68,7 @@ pip install virtualenv
 #### On Debian-based Linuxes
 
 ``` sh
-sudo apt install python-virtualenv python-pip
+sudo apt install python3-virtualenv python3-pip
 ./mach bootstrap
 ```
 
@@ -75,12 +78,16 @@ If `./mach bootstrap` doesn't work, file a bug, and, run the commands below:
 sudo apt install git curl autoconf libx11-dev libfreetype6-dev libgl1-mesa-dri \
     libglib2.0-dev xorg-dev gperf g++ build-essential cmake libssl-dev \
     liblzma-dev libxmu6 libxmu-dev \
+    libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
     libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev libharfbuzz-dev ccache \
     clang libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-bad1.0-dev autoconf2.13 llvm-dev
 ```
 
-Additionally, you'll need a local copy of GStreamer with a version later than 12.0. You can place it in `support/linux/gstreamer/gst`, or run `./mach bootstrap-gstreamer` to set it up.
+Additionally, you'll need a local copy of GStreamer with a version later than 16.2. You can place it in `support/linux/gstreamer/gst`, or run `./mach bootstrap-gstreamer` to set it up. On **Ubuntu 20.04LTS**, you can use the system GStreamer if you install the necessary packages:
+``` sh
+sudo apt install gstreamer1.0-nice gstreamer1.0-plugins-bad
+```
 
 If you are using **Ubuntu 16.04** or **Linux Mint 18.&#42;** run `export HARFBUZZ_SYS_NO_PKG_CONFIG=1` before building to avoid an error with harfbuzz.
 
@@ -142,15 +149,16 @@ export LIBCLANG_PATH=/opt/rh/llvm-toolset-7/root/usr/lib64
 sudo zypper install libX11-devel libexpat-devel Mesa-libEGL-devel Mesa-libGL-devel cabextract cmake \
     dbus-1-devel fontconfig-devel freetype-devel gcc-c++ git glib2-devel gperf \
     harfbuzz-devel libXcursor-devel libXi-devel libXmu-devel libXrandr-devel libopenssl-devel \
-    python-pip python-virtualenv rpm-build ccache llvm-clang libclang autoconf213 gstreamer-devel \
+    python3-pip python3-virtualenv rpm-build ccache llvm-clang libclang autoconf213 gstreamer-devel \
     gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
 ```
 
 #### On Arch Linux
 
 ``` sh
-sudo pacman -S --needed base-devel git python2 python2-virtualenv python2-pip mesa cmake libxmu \
-    pkg-config ttf-fira-sans harfbuzz ccache llvm clang autoconf2.13 gstreamer gstreamer-vaapi
+sudo pacman -S --needed base-devel git python python-virtualenv python-pip mesa cmake libxmu \
+    pkg-config ttf-fira-sans harfbuzz ccache llvm clang autoconf2.13 gstreamer gstreamer-vaapi \
+    gst-plugins-base gst-plugins-good gst-plugins-bad
 ```
 
 #### On Gentoo Linux
@@ -169,26 +177,25 @@ With the following environment variable set:
 export LIBCLANG_PATH=$(llvm-config --prefix)/lib64
 ```
 
+#### On nixOS Linux
+
+```sh
+nix-shell etc/shell.nix
+```
+
+You will need to run this in every shell before running mach.
+
 #### On Windows (MSVC)
 
-1. Install Python 2.7 for Windows (https://www.python.org/downloads/release/python-2716/). The Windows x86-64 MSI installer is fine. This is required for the build system execution and many dependencies.
+1. Install Python 3.9 for Windows (https://www.python.org/downloads/release/python-392/). The Windows x86-64 MSI installer is fine. This is required in order to build the JavaScript engine, SpiderMonkey.
 
-You should change the installation to install the "Add python.exe to Path" feature.
-
-You will also need to set the `PYTHON2` environment variable, e.g., to 'C:\Python27\python.exe' by doing:
+You will also need to set the `PYTHON3` environment variable, e.g., to 'C:\Python39\python.exe' by doing:
 ```
-setx PYTHON2 "C:\Python27\python.exe" /m
-```
-
-2. Install Python 3.7 for Windows (https://www.python.org/downloads/release/python-374/). The Windows x86-64 MSI installer is fine. This is required in order to build the JavaScript engine, SpiderMonkey.
-
-You will also need to set the `PYTHON3` environment variable, e.g., to 'C:\Python37\python.exe' by doing:
-```
-setx PYTHON3 "C:\Python37\python.exe" /m
+setx PYTHON3 "C:\Python39\python.exe" /m
 ```
 The `/m` will set it system-wide for all future command windows.
 
-3. Install virtualenv.
+2. Install virtualenv.
 
  In a normal Windows Shell (cmd.exe or "Command Prompt" from the start menu), do:
  ```
@@ -196,7 +203,7 @@ pip install virtualenv
 ```
  If this does not work, you may need to reboot for the changed PATH settings (by the python installer) to take effect.
 
-4. Install the most recent [GStreamer](https://gstreamer.freedesktop.org/data/pkg/windows/) MSVC packages. You need to download the two `.msi` files for your platform from the [GStreamer](https://gstreamer.freedesktop.org/data/pkg/windows/) website and install them. The currently recommended version is 1.16.0. i.e.:
+3. Install the most recent [GStreamer](https://gstreamer.freedesktop.org/data/pkg/windows/) MSVC packages. You need to download the two `.msi` files for your platform from the [GStreamer](https://gstreamer.freedesktop.org/data/pkg/windows/) website and install them. The currently recommended version is 1.16.0. i.e.:
 
 - [gstreamer-1.0-msvc-x86_64-1.16.0.msi](https://gstreamer.freedesktop.org/data/pkg/windows/1.16.0/gstreamer-1.0-msvc-x86_64-1.16.0.msi)
 - [gstreamer-1.0-devel-msvc-x86_64-1.16.0.msi](https://gstreamer.freedesktop.org/data/pkg/windows/1.16.0/gstreamer-1.0-devel-msvc-x86_64-1.16.0.msi)
@@ -205,10 +212,10 @@ Note that the MinGW binaries will not work, so make sure that you install the MS
 
 Note that you should ensure that _all_ components are installed from gstreamer, as we require many of the optional libraries that are not installed by default.
 
-5. Install Git for Windows (https://git-scm.com/download/win). DO allow it to add git.exe to the PATH (default
+4. Install Git for Windows (https://git-scm.com/download/win). DO allow it to add git.exe to the PATH (default
 settings for the installer are fine).
 
-6. Install Visual Studio Community 2017 (https://www.visualstudio.com/vs/community/). You MUST add "Visual C++" to the
+5. Install Visual Studio Community 2017 (https://www.visualstudio.com/vs/community/). You MUST add "Visual C++" to the
 list of installed components as well as the "Windows Universal C runtime." They are not on by default. Visual Studio 2017 MUST installed to the default location or mach.bat will not find it.
 
 Note that version is hard to download online and is easier to install via [Chocolatey](https://chocolatey.org/install#installing-chocolatey) with:
@@ -237,7 +244,7 @@ linker = "lld-link.exe"
 
 > If you encountered errors with the environment above, do the following for a workaround:
 > 1.  Download and install [Build Tools for Visual Studio 2017](https://www.visualstudio.com/thank-you-downloading-visual-studio/?sku=BuildTools&rel=15)
-> 2.  Install `python2.7 x86-x64` and `virtualenv`
+> 2.  Install `python3.9 x86-x64` and `virtualenv`
 > 3.  Run `mach.bat build -d`.
 
 >If you have troubles with `x64 type` prompt as `mach.bat` set by default:

@@ -405,6 +405,12 @@ impl HTMLInputElement {
         self.input_type.get()
     }
 
+    #[inline]
+    pub fn is_submit_button(&self) -> bool {
+        let input_type = self.input_type.get();
+        input_type == InputType::Submit || input_type == InputType::Image
+    }
+
     pub fn disable_sanitization(&self) {
         self.sanitization_flag.set(false);
     }
@@ -1753,7 +1759,7 @@ impl HTMLInputElement {
 
             // Step 5.10: it's a hidden field named _charset_
             InputType::Hidden => {
-                if name == "_charset_" {
+                if name.to_ascii_lowercase() == "_charset_" {
                     return vec![FormDatum {
                         ty: ty.clone(),
                         name: name,
@@ -2291,6 +2297,8 @@ impl VirtualMethods for HTMLInputElement {
                     let read_write = !(self.ReadOnly() || el.disabled_state());
                     el.set_read_write_state(read_write);
                 }
+
+                el.update_sequentially_focusable_status();
             },
             &local_name!("checked") if !self.checked_changed.get() => {
                 let checked_state = match mutation {
@@ -2520,7 +2528,6 @@ impl VirtualMethods for HTMLInputElement {
 
             //TODO: set the editing position for text inputs
 
-            document_from_node(self).request_focus(self.upcast());
             if self.input_type().is_textual_or_password() &&
                 // Check if we display a placeholder. Layout doesn't know about this.
                 !self.textinput.borrow().is_empty()
@@ -2721,21 +2728,14 @@ impl Activatable for HTMLInputElement {
             // https://html.spec.whatwg.org/multipage/#reset-button-state-%28type=reset%29:activation-behaviour-2
             // https://html.spec.whatwg.org/multipage/#checkbox-state-%28type=checkbox%29:activation-behaviour-2
             // https://html.spec.whatwg.org/multipage/#radio-button-state-%28type=radio%29:activation-behaviour-2
-            InputType::Submit |
-            InputType::Reset |
-            InputType::File |
-            InputType::Checkbox |
-            InputType::Radio => self.is_mutable(),
+            InputType::Submit | InputType::Reset | InputType::File => self.is_mutable(),
+            InputType::Checkbox | InputType::Radio => true,
             _ => false,
         }
     }
 
     // https://dom.spec.whatwg.org/#eventtarget-legacy-pre-activation-behavior
     fn legacy_pre_activation_behavior(&self) -> Option<InputActivationState> {
-        if !self.is_mutable() {
-            return None;
-        }
-
         let ty = self.input_type();
         match ty {
             InputType::Checkbox => {
@@ -2770,9 +2770,6 @@ impl Activatable for HTMLInputElement {
     // https://dom.spec.whatwg.org/#eventtarget-legacy-canceled-activation-behavior
     fn legacy_canceled_activation_behavior(&self, cache: Option<InputActivationState>) {
         // Step 1
-        if !self.is_mutable() {
-            return;
-        }
         let ty = self.input_type();
         let cache = match cache {
             Some(cache) => {

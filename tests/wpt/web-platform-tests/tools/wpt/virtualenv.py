@@ -55,9 +55,9 @@ class Virtualenv(object):
 
     @property
     def pip_path(self):
-        path = find_executable("pip", self.bin_path)
+        path = find_executable("pip3", self.bin_path)
         if path is None:
-            raise ValueError("pip not found")
+            raise ValueError("pip3 not found")
         return path
 
     @property

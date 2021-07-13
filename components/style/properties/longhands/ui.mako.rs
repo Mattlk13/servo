@@ -27,8 +27,6 @@ ${helpers.single_keyword(
     engines="gecko",
     gecko_enum_prefix="StyleScrollbarWidth",
     animation_value_type="discrete",
-    gecko_pref="layout.css.scrollbar-width.enabled",
-    enabled_in="chrome",
     spec="https://drafts.csswg.org/css-scrollbars-1/#scrollbar-width"
 )}
 
@@ -39,7 +37,6 @@ ${helpers.predefined_type(
     engines="gecko",
     extra_prefixes="moz webkit",
     animation_value_type="discrete",
-    needs_context=False,
     spec="https://drafts.csswg.org/css-ui-4/#propdef-user-select",
 )}
 

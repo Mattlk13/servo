@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use crate::body::BodyOperations;
+use crate::body::BodyMixin;
 use crate::dom::bindings::codegen::Bindings::PromiseBinding::PromiseJobCallback;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding::ResponseBinding::ResponseMethods;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding::ResponseType as DOMResponseType;
@@ -45,20 +45,22 @@ use js::jsapi::ContextOptionsRef;
 use js::jsapi::GetPromiseUserInputEventHandlingState;
 use js::jsapi::InitConsumeStreamCallback;
 use js::jsapi::InitDispatchToEventLoop;
-use js::jsapi::JS_SetFutexCanWait;
 use js::jsapi::MimeType;
 use js::jsapi::PromiseUserInputEventHandlingState;
 use js::jsapi::StreamConsumer as JSStreamConsumer;
 use js::jsapi::{BuildIdCharVector, DisableIncrementalGC, GCDescription, GCProgress};
 use js::jsapi::{Dispatchable as JSRunnable, Dispatchable_MaybeShuttingDown};
+use js::jsapi::{
+    GCReason, JSGCInvocationKind, JSGCStatus, JS_AddExtraGCRootsTracer,
+    JS_RequestInterruptCallback, JS_SetGCCallback,
+};
 use js::jsapi::{HandleObject, Heap, JobQueue};
 use js::jsapi::{JSContext as RawJSContext, JSTracer, SetDOMCallbacks, SetGCSliceCallback};
-use js::jsapi::{JSGCInvocationKind, JSGCStatus, JS_AddExtraGCRootsTracer, JS_SetGCCallback};
-use js::jsapi::{JSGCMode, JSGCParamKey, JS_SetGCParameter, JS_SetGlobalJitCompilerOption};
+use js::jsapi::{JSGCParamKey, JS_SetGCParameter, JS_SetGlobalJitCompilerOption};
 use js::jsapi::{
     JSJitCompilerOption, JS_SetOffthreadIonCompilationEnabled, JS_SetParallelParsingEnabled,
 };
-use js::jsapi::{JSObject, PromiseRejectionHandlingState, SetPreserveWrapperCallback};
+use js::jsapi::{JSObject, PromiseRejectionHandlingState, SetPreserveWrapperCallbacks};
 use js::jsapi::{SetJobQueue, SetProcessBuildIdOp, SetPromiseRejectionTrackerCallback};
 use js::jsval::UndefinedValue;
 use js::panic::wrap_panic;
@@ -81,7 +83,6 @@ use std::io::{stdout, Write};
 use std::ops::Deref;
 use std::os;
 use std::os::raw::c_void;
-use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -157,6 +158,7 @@ pub enum ScriptThreadEventCategory {
     EnterFullscreen,
     ExitFullscreen,
     PerformanceTimelineTask,
+    WebGPUMsg,
 }
 
 /// An interface for receiving ScriptMsg values in an event loop. Used for synchronous DOM
@@ -168,29 +170,27 @@ pub trait ScriptPort {
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn get_incumbent_global(_: *const c_void, _: *mut RawJSContext) -> *mut JSObject {
-    wrap_panic(
-        AssertUnwindSafe(|| {
-            let incumbent_global = GlobalScope::incumbent();
+    let mut result = ptr::null_mut();
+    wrap_panic(&mut || {
+        let incumbent_global = GlobalScope::incumbent();
 
-            assert!(incumbent_global.is_some());
+        assert!(incumbent_global.is_some());
 
-            incumbent_global
-                .map(|g| g.reflector().get_jsobject().get())
-                .unwrap_or(ptr::null_mut())
-        }),
-        ptr::null_mut(),
-    )
+        result = incumbent_global
+            .map(|g| g.reflector().get_jsobject().get())
+            .unwrap_or(ptr::null_mut())
+    });
+    result
 }
 
 #[allow(unsafe_code)]
 unsafe extern "C" fn empty(extra: *const c_void) -> bool {
-    wrap_panic(
-        AssertUnwindSafe(|| {
-            let microtask_queue = &*(extra as *const MicrotaskQueue);
-            microtask_queue.empty()
-        }),
-        false,
-    )
+    let mut result = false;
+    wrap_panic(&mut || {
+        let microtask_queue = &*(extra as *const MicrotaskQueue);
+        result = microtask_queue.empty()
+    });
+    result
 }
 
 /// SM callback for promise job resolution. Adds a promise callback to the current
@@ -205,30 +205,34 @@ unsafe extern "C" fn enqueue_promise_job(
     incumbent_global: HandleObject,
 ) -> bool {
     let cx = JSContext::from_ptr(cx);
-    wrap_panic(
-        AssertUnwindSafe(|| {
-            let microtask_queue = &*(extra as *const MicrotaskQueue);
-            let global = GlobalScope::from_object(incumbent_global.get());
-            let pipeline = global.pipeline_id();
-            let interaction = if promise.get().is_null() {
-                PromiseUserInputEventHandlingState::DontCare
-            } else {
-                GetPromiseUserInputEventHandlingState(promise)
-            };
-            let is_user_interacting =
-                interaction == PromiseUserInputEventHandlingState::HadUserInteractionAtCreation;
-            microtask_queue.enqueue(
-                Microtask::Promise(EnqueuedPromiseCallback {
-                    callback: PromiseJobCallback::new(cx, job.get()),
-                    pipeline,
-                    is_user_interacting,
-                }),
-                cx,
-            );
-            true
-        }),
-        false,
-    )
+    let mut result = false;
+    wrap_panic(&mut || {
+        let microtask_queue = &*(extra as *const MicrotaskQueue);
+        let global = if !incumbent_global.is_null() {
+            GlobalScope::from_object(incumbent_global.get())
+        } else {
+            let realm = AlreadyInRealm::assert_for_cx(cx);
+            GlobalScope::from_context(*cx, InRealm::in_realm(&realm))
+        };
+        let pipeline = global.pipeline_id();
+        let interaction = if promise.get().is_null() {
+            PromiseUserInputEventHandlingState::DontCare
+        } else {
+            GetPromiseUserInputEventHandlingState(promise)
+        };
+        let is_user_interacting =
+            interaction == PromiseUserInputEventHandlingState::HadUserInteractionAtCreation;
+        microtask_queue.enqueue(
+            Microtask::Promise(EnqueuedPromiseCallback {
+                callback: PromiseJobCallback::new(cx, job.get()),
+                pipeline,
+                is_user_interacting,
+            }),
+            cx,
+        );
+        result = true
+    });
+    result
 }
 
 #[allow(unsafe_code, unrooted_must_root)]
@@ -247,69 +251,66 @@ unsafe extern "C" fn promise_rejection_tracker(
     let in_realm_proof = AlreadyInRealm::assert_for_cx(cx);
     let global = GlobalScope::from_context(*cx, InRealm::Already(&in_realm_proof));
 
-    wrap_panic(
-        AssertUnwindSafe(|| {
-            match state {
-                // Step 4.
-                PromiseRejectionHandlingState::Unhandled => {
-                    global.add_uncaught_rejection(promise);
-                },
-                // Step 5.
-                PromiseRejectionHandlingState::Handled => {
-                    // Step 5-1.
-                    if global
-                        .get_uncaught_rejections()
-                        .borrow()
-                        .contains(&Heap::boxed(promise.get()))
-                    {
-                        global.remove_uncaught_rejection(promise);
-                        return;
-                    }
+    wrap_panic(&mut || {
+        match state {
+            // Step 4.
+            PromiseRejectionHandlingState::Unhandled => {
+                global.add_uncaught_rejection(promise);
+            },
+            // Step 5.
+            PromiseRejectionHandlingState::Handled => {
+                // Step 5-1.
+                if global
+                    .get_uncaught_rejections()
+                    .borrow()
+                    .contains(&Heap::boxed(promise.get()))
+                {
+                    global.remove_uncaught_rejection(promise);
+                    return;
+                }
 
-                    // Step 5-2.
-                    if !global
-                        .get_consumed_rejections()
-                        .borrow()
-                        .contains(&Heap::boxed(promise.get()))
-                    {
-                        return;
-                    }
+                // Step 5-2.
+                if !global
+                    .get_consumed_rejections()
+                    .borrow()
+                    .contains(&Heap::boxed(promise.get()))
+                {
+                    return;
+                }
 
-                    // Step 5-3.
-                    global.remove_consumed_rejection(promise);
+                // Step 5-3.
+                global.remove_consumed_rejection(promise);
 
-                    let target = Trusted::new(global.upcast::<EventTarget>());
-                    let promise = Promise::new_with_js_promise(Handle::from_raw(promise), cx);
-                    let trusted_promise = TrustedPromise::new(promise.clone());
+                let target = Trusted::new(global.upcast::<EventTarget>());
+                let promise = Promise::new_with_js_promise(Handle::from_raw(promise), cx);
+                let trusted_promise = TrustedPromise::new(promise.clone());
 
-                    // Step 5-4.
-                    global.dom_manipulation_task_source().queue(
-                    task!(rejection_handled_event: move || {
-                        let target = target.root();
-                        let cx = target.global().get_cx();
-                        let root_promise = trusted_promise.root();
+                // Step 5-4.
+                global.dom_manipulation_task_source().queue(
+                task!(rejection_handled_event: move || {
+                    let target = target.root();
+                    let cx = target.global().get_cx();
+                    let root_promise = trusted_promise.root();
 
-                        rooted!(in(*cx) let mut reason = UndefinedValue());
-                        JS_GetPromiseResult(root_promise.reflector().get_jsobject(), reason.handle_mut());
+                    rooted!(in(*cx) let mut reason = UndefinedValue());
+                    JS_GetPromiseResult(root_promise.reflector().get_jsobject(), reason.handle_mut());
 
-                        let event = PromiseRejectionEvent::new(
-                            &target.global(),
-                            atom!("rejectionhandled"),
-                            EventBubbles::DoesNotBubble,
-                            EventCancelable::Cancelable,
-                            root_promise,
-                            reason.handle()
-                        );
+                    let event = PromiseRejectionEvent::new(
+                        &target.global(),
+                        atom!("rejectionhandled"),
+                        EventBubbles::DoesNotBubble,
+                        EventCancelable::Cancelable,
+                        root_promise,
+                        reason.handle()
+                    );
 
-                        event.upcast::<Event>().fire(&target);
-                    }),
-                    global.upcast(),
-                ).unwrap();
-                },
-            };
-        }),
-        (),
-    );
+                    event.upcast::<Event>().fire(&target);
+                }),
+                global.upcast(),
+            ).unwrap();
+            },
+        };
+    })
 }
 
 #[allow(unsafe_code, unrooted_must_root)]
@@ -457,14 +458,6 @@ unsafe fn new_rt_and_cx_with_parent(
     let (cx, runtime) = if let Some(parent) = parent {
         let runtime = RustRuntime::create_with_parent(parent);
         let cx = runtime.cx();
-
-        // Note: this enables blocking on an Atomics.wait,
-        // which should only be enabled for an agent whose [[CanBlock]] is true.
-        // Currently only a dedicated worker agent uses a parent,
-        // and this agent can block.
-        // See https://html.spec.whatwg.org/multipage/#integration-with-the-javascript-agent-cluster-formalism
-        JS_SetFutexCanWait(cx);
-
         (cx, runtime)
     } else {
         let runtime = RustRuntime::new(JS_ENGINE.lock().unwrap().as_ref().unwrap().clone());
@@ -485,8 +478,16 @@ unsafe fn new_rt_and_cx_with_parent(
     unsafe extern "C" fn empty_wrapper_callback(_: *mut RawJSContext, _: HandleObject) -> bool {
         true
     }
+    unsafe extern "C" fn empty_has_released_callback(_: HandleObject) -> bool {
+        // fixme: return true when the Drop impl for a DOM object has been invoked
+        false
+    }
     SetDOMCallbacks(cx, &DOM_CALLBACKS);
-    SetPreserveWrapperCallback(cx, Some(empty_wrapper_callback));
+    SetPreserveWrapperCallbacks(
+        cx,
+        Some(empty_wrapper_callback),
+        Some(empty_has_released_callback),
+    );
     // Pre barriers aren't working correctly at the moment
     DisableIncrementalGC(cx);
 
@@ -549,7 +550,7 @@ unsafe fn new_rt_and_cx_with_parent(
     }
     cx_opts.set_wasmBaseline_(pref!(js.wasm.baseline.enabled));
     cx_opts.set_wasmIon_(pref!(js.wasm.ion.enabled));
-    cx_opts.set_extraWarnings_(pref!(js.strict.enabled));
+    cx_opts.set_strictMode_(pref!(js.strict.enabled));
     // TODO: handle js.strict.debug.enabled
     // TODO: handle js.throw_on_asmjs_validation_failure (needs new Spidermonkey)
     JS_SetGlobalJitCompilerOption(
@@ -581,7 +582,6 @@ unsafe fn new_rt_and_cx_with_parent(
     // TODO: handle js.asyncstack.enabled (needs new Spidermonkey)
     // TODO: handle js.throw_on_debugee_would_run (needs new Spidermonkey)
     // TODO: handle js.dump_stack_on_debugee_would_run (needs new Spidermonkey)
-    cx_opts.set_werror_(pref!(js.werror.enabled));
     // TODO: handle js.shared_memory.enabled
     JS_SetGCParameter(
         cx,
@@ -591,14 +591,16 @@ unsafe fn new_rt_and_cx_with_parent(
             .unwrap_or(u32::max_value()),
     );
     // NOTE: This is disabled above, so enabling it here will do nothing for now.
-    let js_gc_mode = if pref!(js.mem.gc.incremental.enabled) {
-        JSGCMode::JSGC_MODE_INCREMENTAL
-    } else if pref!(js.mem.gc.per_zone.enabled) {
-        JSGCMode::JSGC_MODE_ZONE
-    } else {
-        JSGCMode::JSGC_MODE_GLOBAL
-    };
-    JS_SetGCParameter(cx, JSGCParamKey::JSGC_MODE, js_gc_mode as u32);
+    JS_SetGCParameter(
+        cx,
+        JSGCParamKey::JSGC_INCREMENTAL_GC_ENABLED,
+        pref!(js.mem.gc.incremental.enabled) as u32,
+    );
+    JS_SetGCParameter(
+        cx,
+        JSGCParamKey::JSGC_PER_ZONE_GC_ENABLED,
+        pref!(js.mem.gc.per_zone.enabled) as u32,
+    );
     if let Some(val) = in_range(pref!(js.mem.gc.incremental.slice_ms), 0, 100_000) {
         JS_SetGCParameter(cx, JSGCParamKey::JSGC_SLICE_TIME_BUDGET_MS, val as u32);
     }
@@ -611,49 +613,39 @@ unsafe fn new_rt_and_cx_with_parent(
     if let Some(val) = in_range(pref!(js.mem.gc.high_frequency_time_limit_ms), 0, 10_000) {
         JS_SetGCParameter(cx, JSGCParamKey::JSGC_HIGH_FREQUENCY_TIME_LIMIT, val as u32);
     }
-    JS_SetGCParameter(
-        cx,
-        JSGCParamKey::JSGC_DYNAMIC_MARK_SLICE,
-        pref!(js.mem.gc.dynamic_mark_slice.enabled) as u32,
-    );
-    JS_SetGCParameter(
-        cx,
-        JSGCParamKey::JSGC_DYNAMIC_HEAP_GROWTH,
-        pref!(js.mem.gc.dynamic_heap_growth.enabled) as u32,
-    );
     if let Some(val) = in_range(pref!(js.mem.gc.low_frequency_heap_growth), 0, 10_000) {
         JS_SetGCParameter(cx, JSGCParamKey::JSGC_LOW_FREQUENCY_HEAP_GROWTH, val as u32);
     }
     if let Some(val) = in_range(pref!(js.mem.gc.high_frequency_heap_growth_min), 0, 10_000) {
         JS_SetGCParameter(
             cx,
-            JSGCParamKey::JSGC_HIGH_FREQUENCY_HEAP_GROWTH_MIN,
+            JSGCParamKey::JSGC_HIGH_FREQUENCY_LARGE_HEAP_GROWTH,
             val as u32,
         );
     }
     if let Some(val) = in_range(pref!(js.mem.gc.high_frequency_heap_growth_max), 0, 10_000) {
         JS_SetGCParameter(
             cx,
-            JSGCParamKey::JSGC_HIGH_FREQUENCY_HEAP_GROWTH_MAX,
+            JSGCParamKey::JSGC_HIGH_FREQUENCY_SMALL_HEAP_GROWTH,
             val as u32,
         );
     }
     if let Some(val) = in_range(pref!(js.mem.gc.high_frequency_low_limit_mb), 0, 10_000) {
-        JS_SetGCParameter(cx, JSGCParamKey::JSGC_HIGH_FREQUENCY_LOW_LIMIT, val as u32);
+        JS_SetGCParameter(cx, JSGCParamKey::JSGC_SMALL_HEAP_SIZE_MAX, val as u32);
     }
     if let Some(val) = in_range(pref!(js.mem.gc.high_frequency_high_limit_mb), 0, 10_000) {
-        JS_SetGCParameter(cx, JSGCParamKey::JSGC_HIGH_FREQUENCY_HIGH_LIMIT, val as u32);
+        JS_SetGCParameter(cx, JSGCParamKey::JSGC_LARGE_HEAP_SIZE_MIN, val as u32);
     }
-    if let Some(val) = in_range(pref!(js.mem.gc.allocation_threshold_factor), 0, 10_000) {
+    /*if let Some(val) = in_range(pref!(js.mem.gc.allocation_threshold_factor), 0, 10_000) {
         JS_SetGCParameter(cx, JSGCParamKey::JSGC_NON_INCREMENTAL_FACTOR, val as u32);
-    }
-    if let Some(val) = in_range(
-        pref!(js.mem.gc.allocation_threshold_avoid_interrupt_factor),
-        0,
-        10_000,
-    ) {
-        JS_SetGCParameter(cx, JSGCParamKey::JSGC_AVOID_INTERRUPT_FACTOR, val as u32);
-    }
+    }*/
+    /*
+        // JSGC_SMALL_HEAP_INCREMENTAL_LIMIT
+        pref("javascript.options.mem.gc_small_heap_incremental_limit", 140);
+
+        // JSGC_LARGE_HEAP_INCREMENTAL_LIMIT
+        pref("javascript.options.mem.gc_large_heap_incremental_limit", 110);
+    */
     if let Some(val) = in_range(pref!(js.mem.gc.empty_chunk_count_min), 0, 10_000) {
         JS_SetGCParameter(cx, JSGCParamKey::JSGC_MIN_EMPTY_CHUNK_COUNT, val as u32);
     }
@@ -803,6 +795,7 @@ unsafe extern "C" fn gc_slice_callback(
 unsafe extern "C" fn debug_gc_callback(
     _cx: *mut RawJSContext,
     status: JSGCStatus,
+    _reason: GCReason,
     _data: *mut os::raw::c_void,
 ) {
     match status {
@@ -854,6 +847,34 @@ unsafe fn set_gc_zeal_options(cx: *mut RawJSContext) {
 #[allow(unsafe_code)]
 #[cfg(not(feature = "debugmozjs"))]
 unsafe fn set_gc_zeal_options(_: *mut RawJSContext) {}
+
+#[repr(transparent)]
+/// A wrapper around a JSContext that is Send,
+/// enabling an interrupt to be requested
+/// from a thread other than the one running JS using that context.
+pub struct ContextForRequestInterrupt(*mut RawJSContext);
+
+impl ContextForRequestInterrupt {
+    pub fn new(context: *mut RawJSContext) -> ContextForRequestInterrupt {
+        ContextForRequestInterrupt(context)
+    }
+
+    #[allow(unsafe_code)]
+    /// Can be called from any thread, to request the callback set by
+    /// JS_AddInterruptCallback to be called
+    /// on the thread where that context is running.
+    pub fn request_interrupt(&self) {
+        unsafe {
+            JS_RequestInterruptCallback(self.0);
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+/// It is safe to call `JS_RequestInterruptCallback(cx)` from any thread.
+/// See the docs for the corresponding `requestInterrupt` method,
+/// at `mozjs/js/src/vm/JSContext.h`.
+unsafe impl Send for ContextForRequestInterrupt {}
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -985,7 +1006,7 @@ unsafe extern "C" fn consume_stream(
         }
 
         // Step 2.6.2 If response body is alreaady consumed, return with a TypeError and abort these substeps.
-        if unwrapped_source.get_body_used() {
+        if unwrapped_source.is_disturbed() {
             throw_dom_exception(
                 cx,
                 &global,

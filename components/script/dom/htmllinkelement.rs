@@ -13,7 +13,8 @@ use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::document::Document;
 use crate::dom::domtokenlist::DOMTokenList;
 use crate::dom::element::{
-    cors_setting_for_element, reflect_cross_origin_attribute, set_cross_origin_attribute,
+    cors_setting_for_element, reflect_cross_origin_attribute, reflect_referrer_policy_attribute,
+    set_cross_origin_attribute,
 };
 use crate::dom::element::{AttributeMutation, Element, ElementCreator};
 use crate::dom::htmlelement::HTMLElement;
@@ -30,6 +31,7 @@ use embedder_traits::EmbedderMsg;
 use html5ever::{LocalName, Prefix};
 use net_traits::ReferrerPolicy;
 use servo_arc::Arc;
+use servo_atoms::Atom;
 use std::borrow::ToOwned;
 use std::cell::Cell;
 use std::default::Default;
@@ -37,7 +39,7 @@ use style::attr::AttrValue;
 use style::media_queries::MediaList;
 use style::parser::ParserContext as CssParserContext;
 use style::str::HTML_SPACE_CHARACTERS;
-use style::stylesheets::{CssRuleType, Stylesheet};
+use style::stylesheets::{CssRuleType, Origin, Stylesheet};
 use style_traits::ParsingMode;
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
@@ -115,7 +117,7 @@ impl HTMLLinkElement {
             stylesheets_owner.remove_stylesheet(self.upcast(), s)
         }
         *self.stylesheet.borrow_mut() = Some(s.clone());
-        self.cssom_stylesheet.set(None);
+        self.clean_stylesheet_ownership();
         stylesheets_owner.add_stylesheet(self.upcast(), s);
     }
 
@@ -146,6 +148,13 @@ impl HTMLLinkElement {
                 .any(|s| s.eq_ignore_ascii_case("alternate")),
             None => false,
         }
+    }
+
+    fn clean_stylesheet_ownership(&self) {
+        if let Some(cssom_stylesheet) = self.cssom_stylesheet.get() {
+            cssom_stylesheet.set_owner(None);
+        }
+        self.cssom_stylesheet.set(None);
     }
 }
 
@@ -254,6 +263,7 @@ impl VirtualMethods for HTMLLinkElement {
         }
 
         if let Some(s) = self.stylesheet.borrow_mut().take() {
+            self.clean_stylesheet_ownership();
             stylesheets_owner_from_node(self).remove_stylesheet(self.upcast(), &s);
         }
     }
@@ -300,7 +310,8 @@ impl HTMLLinkElement {
         // FIXME(emilio): This looks somewhat fishy, since we use the context
         // only to parse the media query list, CssRuleType::Media doesn't make
         // much sense.
-        let context = CssParserContext::new_for_cssom(
+        let context = CssParserContext::new(
+            Origin::Author,
             &doc_url,
             Some(CssRuleType::Media),
             ParsingMode::DEFAULT,
@@ -428,8 +439,29 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-link-rellist
     fn RelList(&self) -> DomRoot<DOMTokenList> {
-        self.rel_list
-            .or_init(|| DOMTokenList::new(self.upcast(), &local_name!("rel")))
+        self.rel_list.or_init(|| {
+            DOMTokenList::new(
+                self.upcast(),
+                &local_name!("rel"),
+                Some(vec![
+                    Atom::from("alternate"),
+                    Atom::from("apple-touch-icon"),
+                    Atom::from("apple-touch-icon-precomposed"),
+                    Atom::from("canonical"),
+                    Atom::from("dns-prefetch"),
+                    Atom::from("icon"),
+                    Atom::from("import"),
+                    Atom::from("manifest"),
+                    Atom::from("modulepreload"),
+                    Atom::from("next"),
+                    Atom::from("preconnect"),
+                    Atom::from("prefetch"),
+                    Atom::from("preload"),
+                    Atom::from("prerender"),
+                    Atom::from("stylesheet"),
+                ]),
+            )
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-link-charset
@@ -459,6 +491,14 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
     fn SetCrossOrigin(&self, value: Option<DOMString>) {
         set_cross_origin_attribute(self.upcast::<Element>(), value);
     }
+
+    // https://html.spec.whatwg.org/multipage/#dom-link-referrerpolicy
+    fn ReferrerPolicy(&self) -> DOMString {
+        reflect_referrer_policy_attribute(self.upcast::<Element>())
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-link-referrerpolicy
+    make_setter!(SetReferrerPolicy, "referrerpolicy");
 
     // https://drafts.csswg.org/cssom/#dom-linkstyle-sheet
     fn GetSheet(&self) -> Option<DomRoot<DOMStyleSheet>> {

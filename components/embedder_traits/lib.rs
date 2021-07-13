@@ -19,7 +19,7 @@ use keyboard_types::KeyboardEvent;
 use msg::constellation_msg::{InputMethodType, PipelineId, TopLevelBrowsingContextId};
 use servo_url::ServoUrl;
 use std::fmt::{Debug, Error, Formatter};
-use webrender_api::units::{DeviceIntPoint, DeviceIntSize};
+use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 
 pub use webxr_api::MainThreadWaker as EventLoopWaker;
 
@@ -197,7 +197,10 @@ pub enum EmbedderMsg {
     /// Open interface to request permission specified by prompt.
     PromptPermission(PermissionPrompt, IpcSender<PermissionRequest>),
     /// Request to present an IME to the user when an editable element is focused.
-    ShowIME(InputMethodType),
+    /// If the input is text, the second parameter defines the pre-existing string
+    /// text content and the zero-based index into the string locating the insertion point.
+    /// bool is true for multi-line and false otherwise.
+    ShowIME(InputMethodType, Option<(String, i32)>, bool, DeviceIntRect),
     /// Request to hide the IME when the editable element is blurred.
     HideIME,
     /// Servo has shut down
@@ -207,8 +210,8 @@ pub enum EmbedderMsg {
     /// Notifies the embedder about media session events
     /// (i.e. when there is metadata for the active media session, playback state changes...).
     MediaSessionEvent(MediaSessionEvent),
-    /// Report the status of Devtools Server
-    OnDevtoolsStarted(Result<u16, ()>),
+    /// Report the status of Devtools Server with a token that can be used to bypass the permission prompt.
+    OnDevtoolsStarted(Result<u16, ()>, String),
 }
 
 impl Debug for EmbedderMsg {

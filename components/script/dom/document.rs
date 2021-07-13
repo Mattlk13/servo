@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use crate::animation_timeline::AnimationTimeline;
-use crate::animations::{Animations, AnimationsUpdate};
+use crate::animations::Animations;
 use crate::document_loader::{DocumentLoader, LoadType};
 use crate::dom::attr::Attr;
 use crate::dom::beforeunloadevent::BeforeUnloadEvent;
@@ -15,6 +15,9 @@ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventBinding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElementBinding::HTMLIFrameElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLTextAreaElementBinding::HTMLTextAreaElementMethods;
+use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorBinding::NavigatorMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::NodeFilterBinding::NodeFilter;
 use crate::dom::bindings::codegen::Bindings::PerformanceBinding::PerformanceMethods;
@@ -53,6 +56,7 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable, EventDefault, Even
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::focusevent::FocusEvent;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::gpucanvascontext::{GPUCanvasContext, WebGPUContextId};
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::htmlareaelement::HTMLAreaElement;
@@ -66,7 +70,9 @@ use crate::dom::htmlheadelement::HTMLHeadElement;
 use crate::dom::htmlhtmlelement::HTMLHtmlElement;
 use crate::dom::htmliframeelement::HTMLIFrameElement;
 use crate::dom::htmlimageelement::HTMLImageElement;
+use crate::dom::htmlinputelement::HTMLInputElement;
 use crate::dom::htmlscriptelement::{HTMLScriptElement, ScriptResult};
+use crate::dom::htmltextareaelement::HTMLTextAreaElement;
 use crate::dom::htmltitleelement::HTMLTitleElement;
 use crate::dom::keyboardevent::KeyboardEvent;
 use crate::dom::location::Location;
@@ -105,18 +111,18 @@ use crate::stylesheet_set::StylesheetSetRef;
 use crate::task::TaskBox;
 use crate::task_source::{TaskSource, TaskSourceName};
 use crate::timers::OneshotTimerCallback;
-use canvas_traits::webgl::{self, SwapChainId, WebGLContextId, WebGLMsg};
+use canvas_traits::webgl::{self, WebGLContextId, WebGLMsg};
 use content_security_policy::{self as csp, CspList};
 use cookie::Cookie;
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use dom_struct::dom_struct;
 use embedder_traits::EmbedderMsg;
 use encoding_rs::{Encoding, UTF_8};
-use euclid::default::Point2D;
+use euclid::default::{Point2D, Rect, Size2D};
 use html5ever::{LocalName, Namespace, QualName};
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcSender};
-use js::jsapi::{JSObject, JSRuntime};
+use js::jsapi::JSObject;
 use keyboard_types::{Code, Key, KeyState};
 use metrics::{
     InteractiveFlag, InteractiveMetrics, InteractiveWindow, ProfilerMetadataFactory,
@@ -134,7 +140,6 @@ use num_traits::ToPrimitive;
 use percent_encoding::percent_decode;
 use profile_traits::ipc as profile_ipc;
 use profile_traits::time::{TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType};
-use ref_slice::ref_slice;
 use script_layout_interface::message::{Msg, PendingRestyle, ReflowGoal};
 use script_layout_interface::TrustedNodeAddress;
 use script_traits::{AnimationState, DocumentActivity, MouseButton, MouseEventType};
@@ -155,6 +160,7 @@ use std::default::Default;
 use std::mem;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::slice::from_ref;
 use std::time::{Duration, Instant};
 use style::attr::AttrValue;
 use style::context::QuirksMode;
@@ -167,6 +173,7 @@ use style::stylesheet_set::DocumentStylesheetSet;
 use style::stylesheets::{Origin, OriginSet, Stylesheet};
 use url::Host;
 use uuid::Uuid;
+use webrender_api::units::DeviceIntRect;
 
 /// The number of times we are allowed to see spurious `requestAnimationFrame()` calls before
 /// falling back to fake ones.
@@ -182,10 +189,13 @@ pub enum TouchEventResult {
     Forwarded,
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub enum FireMouseEventType {
     Move,
     Over,
     Out,
+    Enter,
+    Leave,
 }
 
 impl FireMouseEventType {
@@ -194,6 +204,8 @@ impl FireMouseEventType {
             &FireMouseEventType::Move => "mousemove",
             &FireMouseEventType::Over => "mouseover",
             &FireMouseEventType::Out => "mouseout",
+            &FireMouseEventType::Enter => "mouseenter",
+            &FireMouseEventType::Leave => "mouseleave",
         }
     }
 }
@@ -202,6 +214,16 @@ impl FireMouseEventType {
 pub enum IsHTMLDocument {
     HTMLDocument,
     NonHTMLDocument,
+}
+
+#[derive(JSTraceable, MallocSizeOf)]
+#[unrooted_must_root_lint::must_root]
+enum FocusTransaction {
+    /// No focus operation is in effect.
+    NotInTransaction,
+    /// A focus operation is in effect.
+    /// Contains the element that has most recently requested focus for itself.
+    InTransaction(Option<Dom<Element>>),
 }
 
 /// <https://dom.spec.whatwg.org/#document>
@@ -243,8 +265,8 @@ pub struct Document {
     ready_state: Cell<DocumentReadyState>,
     /// Whether the DOMContentLoaded event has already been dispatched.
     domcontentloaded_dispatched: Cell<bool>,
-    /// The element that has most recently requested focus for itself.
-    possibly_focused: MutNullableDom<Element>,
+    /// The state of this document's focus transaction.
+    focus_transaction: DomRefCell<FocusTransaction>,
     /// The element that currently has the document focus context.
     focused: MutNullableDom<Element>,
     /// The script element that is currently executing.
@@ -377,6 +399,8 @@ pub struct Document {
     media_controls: DomRefCell<HashMap<String, Dom<ShadowRoot>>>,
     /// List of all WebGL context IDs that need flushing.
     dirty_webgl_contexts: DomRefCell<HashMap<WebGLContextId, Dom<WebGLRenderingContext>>>,
+    /// List of all WebGPU context IDs that need flushing.
+    dirty_webgpu_contexts: DomRefCell<HashMap<WebGPUContextId, Dom<GPUCanvasContext>>>,
     /// https://html.spec.whatwg.org/multipage/#concept-document-csp-list
     #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
     csp_list: DomRefCell<Option<CspList>>,
@@ -387,6 +411,8 @@ pub struct Document {
     animation_timeline: DomRefCell<AnimationTimeline>,
     /// Animations for this Document
     animations: DomRefCell<Animations>,
+    /// The nearest inclusive ancestors to all the nodes that require a restyle.
+    dirty_root: MutNullableDom<Element>,
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -446,6 +472,113 @@ enum ElementLookupResult {
 
 #[allow(non_snake_case)]
 impl Document {
+    pub fn note_node_with_dirty_descendants(&self, node: &Node) {
+        debug_assert!(*node.owner_doc() == *self);
+        if !node.is_connected() {
+            return;
+        }
+
+        let parent = match node.inclusive_ancestors(ShadowIncluding::Yes).nth(1) {
+            Some(parent) => parent,
+            None => {
+                // There is no parent so this is the Document node, so we
+                // behave as if we were called with the document element.
+                let document_element = match self.GetDocumentElement() {
+                    Some(element) => element,
+                    None => return,
+                };
+                if let Some(dirty_root) = self.dirty_root.get() {
+                    // There was an existing dirty root so we mark its
+                    // ancestors as dirty until the document element.
+                    for ancestor in dirty_root
+                        .upcast::<Node>()
+                        .inclusive_ancestors(ShadowIncluding::Yes)
+                    {
+                        if ancestor.is::<Element>() {
+                            ancestor.set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, true);
+                        }
+                    }
+                }
+                self.dirty_root.set(Some(&document_element));
+                return;
+            },
+        };
+
+        if parent.is::<Element>() {
+            if !parent.is_styled() {
+                return;
+            }
+
+            if parent.is_display_none() {
+                return;
+            }
+        }
+
+        let element_parent: DomRoot<Element>;
+        let element = match node.downcast::<Element>() {
+            Some(element) => element,
+            None => {
+                // Current node is not an element, it's probably a text node,
+                // we try to get its element parent.
+                match DomRoot::downcast::<Element>(parent) {
+                    Some(parent) => {
+                        element_parent = parent;
+                        &element_parent
+                    },
+                    None => {
+                        // Parent is not an element so it must be a document,
+                        // and this is not an element either, so there is
+                        // nothing to do.
+                        return;
+                    },
+                }
+            },
+        };
+
+        let dirty_root = match self.dirty_root.get() {
+            None => {
+                element
+                    .upcast::<Node>()
+                    .set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, true);
+                self.dirty_root.set(Some(element));
+                return;
+            },
+            Some(root) => root,
+        };
+
+        for ancestor in element
+            .upcast::<Node>()
+            .inclusive_ancestors(ShadowIncluding::Yes)
+        {
+            if ancestor.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS) {
+                return;
+            }
+            if ancestor.is::<Element>() {
+                ancestor.set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, true);
+            }
+        }
+
+        let new_dirty_root = element
+            .upcast::<Node>()
+            .common_ancestor(dirty_root.upcast(), ShadowIncluding::Yes)
+            .expect("Couldn't find common ancestor");
+
+        let mut has_dirty_descendants = true;
+        for ancestor in dirty_root
+            .upcast::<Node>()
+            .inclusive_ancestors(ShadowIncluding::Yes)
+        {
+            ancestor.set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, has_dirty_descendants);
+            has_dirty_descendants &= *ancestor != *new_dirty_root;
+        }
+        self.dirty_root
+            .set(Some(new_dirty_root.downcast::<Element>().unwrap()));
+    }
+
+    pub fn take_dirty_root(&self) -> Option<DomRoot<Element>> {
+        self.dirty_root.take()
+    }
+
     #[inline]
     pub fn loader(&self) -> Ref<DocumentLoader> {
         self.loader.borrow()
@@ -575,10 +708,25 @@ impl Document {
 
     // https://html.spec.whatwg.org/multipage/#fallback-base-url
     pub fn fallback_base_url(&self) -> ServoUrl {
-        // Step 1: iframe srcdoc (#4767).
-        // Step 2: about:blank with a creator browsing context.
-        // Step 3.
-        self.url()
+        let document_url = self.url();
+        if let Some(browsing_context) = self.browsing_context() {
+            // Step 1: If document is an iframe srcdoc document, then return the
+            // document base URL of document's browsing context's container document.
+            let container_base_url = browsing_context
+                .parent()
+                .and_then(|parent| parent.document())
+                .map(|document| document.base_url());
+            if document_url.as_str() == "about:srcdoc" && container_base_url.is_some() {
+                return container_base_url.unwrap();
+            }
+            // Step 2: If document's URL is about:blank, and document's browsing
+            // context's creator base URL is non-null, then return that creator base URL.
+            if document_url.as_str() == "about:blank" && browsing_context.has_creator_base_url() {
+                return browsing_context.creator_base_url().unwrap();
+            }
+        }
+        // Step 3: Return document's URL.
+        document_url
     }
 
     // https://html.spec.whatwg.org/multipage/#document-base-url
@@ -663,10 +811,10 @@ impl Document {
         self.quirks_mode.set(mode);
 
         if mode == QuirksMode::Quirks {
-            self.window
-                .layout_chan()
-                .send(Msg::SetQuirksMode(mode))
-                .unwrap();
+            match self.window.layout_chan() {
+                Some(chan) => chan.send(Msg::SetQuirksMode(mode)).unwrap(),
+                None => warn!("Layout channel unavailable"),
+            }
         }
     }
 
@@ -861,9 +1009,15 @@ impl Document {
     pub fn set_ready_state(&self, state: DocumentReadyState) {
         match state {
             DocumentReadyState::Loading => {
+                if self.window().is_top_level() {
+                    self.send_to_embedder(EmbedderMsg::LoadStart);
+                }
                 update_with_current_time_ms(&self.dom_loading);
             },
             DocumentReadyState::Complete => {
+                if self.window().is_top_level() {
+                    self.send_to_embedder(EmbedderMsg::LoadComplete);
+                }
                 update_with_current_time_ms(&self.dom_complete);
             },
             DocumentReadyState::Interactive => update_with_current_time_ms(&self.dom_interactive),
@@ -888,21 +1042,52 @@ impl Document {
 
     /// Initiate a new round of checking for elements requesting focus. The last element to call
     /// `request_focus` before `commit_focus_transaction` is called will receive focus.
-    pub fn begin_focus_transaction(&self) {
-        self.possibly_focused.set(None);
+    fn begin_focus_transaction(&self) {
+        *self.focus_transaction.borrow_mut() = FocusTransaction::InTransaction(Default::default());
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#focus-fixup-rule>
+    pub(crate) fn perform_focus_fixup_rule(&self, not_focusable: &Element) {
+        if Some(not_focusable) != self.focused.get().as_ref().map(|e| &**e) {
+            return;
+        }
+        self.request_focus(
+            self.GetBody().as_ref().map(|e| &*e.upcast()),
+            FocusType::Element,
+        )
     }
 
     /// Request that the given element receive focus once the current transaction is complete.
-    pub fn request_focus(&self, elem: &Element) {
-        if elem.is_focusable_area() {
-            self.possibly_focused.set(Some(elem))
+    /// If None is passed, then whatever element is currently focused will no longer be focused
+    /// once the transaction is complete.
+    pub(crate) fn request_focus(&self, elem: Option<&Element>, focus_type: FocusType) {
+        let implicit_transaction = matches!(
+            *self.focus_transaction.borrow(),
+            FocusTransaction::NotInTransaction
+        );
+        if implicit_transaction {
+            self.begin_focus_transaction();
+        }
+        if elem.map_or(true, |e| e.is_focusable_area()) {
+            *self.focus_transaction.borrow_mut() =
+                FocusTransaction::InTransaction(elem.map(Dom::from_ref));
+        }
+        if implicit_transaction {
+            self.commit_focus_transaction(focus_type);
         }
     }
 
     /// Reassign the focus context to the element that last requested focus during this
     /// transaction, or none if no elements requested it.
-    pub fn commit_focus_transaction(&self, focus_type: FocusType) {
-        if self.focused == self.possibly_focused.get().as_deref() {
+    fn commit_focus_transaction(&self, focus_type: FocusType) {
+        let possibly_focused = match *self.focus_transaction.borrow() {
+            FocusTransaction::NotInTransaction => unreachable!(),
+            FocusTransaction::InTransaction(ref elem) => {
+                elem.as_ref().map(|e| DomRoot::from_ref(&**e))
+            },
+        };
+        *self.focus_transaction.borrow_mut() = FocusTransaction::NotInTransaction;
+        if self.focused == possibly_focused.as_ref().map(|e| &**e) {
             return;
         }
         if let Some(ref elem) = self.focused.get() {
@@ -917,7 +1102,7 @@ impl Document {
             }
         }
 
-        self.focused.set(self.possibly_focused.get().as_deref());
+        self.focused.set(possibly_focused.as_ref().map(|e| &**e));
 
         if let Some(ref elem) = self.focused.get() {
             elem.set_focus_state(true);
@@ -932,7 +1117,36 @@ impl Document {
 
             // Notify the embedder to display an input method.
             if let Some(kind) = elem.input_method_type() {
-                self.send_to_embedder(EmbedderMsg::ShowIME(kind));
+                let rect = elem.upcast::<Node>().bounding_content_box_or_zero();
+                let rect = Rect::new(
+                    Point2D::new(rect.origin.x.to_px(), rect.origin.y.to_px()),
+                    Size2D::new(rect.size.width.to_px(), rect.size.height.to_px()),
+                );
+                let (text, multiline) = if let Some(input) = elem.downcast::<HTMLInputElement>() {
+                    (
+                        Some((
+                            (&input.Value()).to_string(),
+                            input.GetSelectionEnd().unwrap_or(0) as i32,
+                        )),
+                        false,
+                    )
+                } else if let Some(textarea) = elem.downcast::<HTMLTextAreaElement>() {
+                    (
+                        Some((
+                            (&textarea.Value()).to_string(),
+                            textarea.GetSelectionEnd().unwrap_or(0) as i32,
+                        )),
+                        true,
+                    )
+                } else {
+                    (None, false)
+                };
+                self.send_to_embedder(EmbedderMsg::ShowIME(
+                    kind,
+                    text,
+                    multiline,
+                    DeviceIntRect::from_untyped(&rect),
+                ));
             }
         }
     }
@@ -941,9 +1155,13 @@ impl Document {
     pub fn title_changed(&self) {
         if self.browsing_context().is_some() {
             self.send_title_to_embedder();
+            let title = String::from(self.Title());
+            self.window.send_to_constellation(ScriptMsg::TitleChanged(
+                self.window.pipeline_id(),
+                title.clone(),
+            ));
             let global = self.window.upcast::<GlobalScope>();
             if let Some(ref chan) = global.devtools_chan() {
-                let title = String::from(self.Title());
                 let _ = chan.send(ScriptToDevtoolsControlMsg::TitleChanged(
                     global.pipeline_id(),
                     title,
@@ -967,17 +1185,22 @@ impl Document {
     }
 
     pub fn dirty_all_nodes(&self) {
-        let root = self.upcast::<Node>();
-        for node in root.traverse_preorder(ShadowIncluding::Yes) {
+        let root = match self.GetDocumentElement() {
+            Some(root) => root,
+            None => return,
+        };
+        for node in root
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::Yes)
+        {
             node.dirty(NodeDamage::OtherNodeDamage)
         }
     }
 
     #[allow(unsafe_code)]
-    pub fn handle_mouse_event(
+    pub unsafe fn handle_mouse_event(
         &self,
-        js_runtime: *mut JSRuntime,
-        _button: MouseButton,
+        button: MouseButton,
         client_point: Point2D<f32>,
         mouse_event_type: MouseEventType,
         node_address: Option<UntrustedNodeAddress>,
@@ -992,7 +1215,7 @@ impl Document {
         debug!("{}: at {:?}", mouse_event_type_string, client_point);
 
         let el = node_address.and_then(|address| {
-            let node = unsafe { node::from_untrusted_node_address(js_runtime, address) };
+            let node = node::from_untrusted_node_address(address);
             node.inclusive_ancestors(ShadowIncluding::No)
                 .filter_map(DomRoot::downcast::<Element>)
                 .next()
@@ -1011,6 +1234,7 @@ impl Document {
             }
 
             self.begin_focus_transaction();
+            self.request_focus(Some(&*el), FocusType::Element);
         }
 
         // https://w3c.github.io/uievents/#event-type-click
@@ -1032,7 +1256,11 @@ impl Document {
             false,
             false,
             false,
-            0i16,
+            match &button {
+                MouseButton::Left => 0i16,
+                MouseButton::Middle => 1i16,
+                MouseButton::Right => 2i16,
+            },
             pressed_mouse_buttons,
             None,
             point_in_node,
@@ -1141,6 +1369,8 @@ impl Document {
         client_point: Point2D<f32>,
         target: &EventTarget,
         event_name: FireMouseEventType,
+        can_bubble: EventBubbles,
+        cancelable: EventCancelable,
         pressed_mouse_buttons: u16,
     ) {
         let client_x = client_point.x.to_i32().unwrap_or(0);
@@ -1149,8 +1379,8 @@ impl Document {
         let mouse_event = MouseEvent::new(
             &self.window,
             DOMString::from(event_name.as_str()),
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
+            can_bubble,
+            cancelable,
             Some(&self.window),
             0i32,
             client_x,
@@ -1171,88 +1401,75 @@ impl Document {
     }
 
     #[allow(unsafe_code)]
-    pub fn handle_mouse_move_event(
+    pub unsafe fn handle_mouse_move_event(
         &self,
-        js_runtime: *mut JSRuntime,
-        client_point: Option<Point2D<f32>>,
+        client_point: Point2D<f32>,
         prev_mouse_over_target: &MutNullableDom<Element>,
         node_address: Option<UntrustedNodeAddress>,
         pressed_mouse_buttons: u16,
     ) {
-        let client_point = match client_point {
-            None => {
-                // If there's no point, there's no target under the mouse
-                // FIXME: dispatch mouseout here. We have no point.
-                prev_mouse_over_target.set(None);
-                return;
-            },
-            Some(client_point) => client_point,
-        };
-
         let maybe_new_target = node_address.and_then(|address| {
-            let node = unsafe { node::from_untrusted_node_address(js_runtime, address) };
+            let node = node::from_untrusted_node_address(address);
             node.inclusive_ancestors(ShadowIncluding::No)
                 .filter_map(DomRoot::downcast::<Element>)
                 .next()
         });
 
-        // Send mousemove event to topmost target, unless it's an iframe, in which case the
-        // compositor should have also sent an event to the inner document.
         let new_target = match maybe_new_target {
             Some(ref target) => target,
             None => return,
         };
 
-        self.fire_mouse_event(
-            client_point,
-            new_target.upcast(),
-            FireMouseEventType::Move,
-            pressed_mouse_buttons,
-        );
-
-        // Nothing more to do here, mousemove is sent,
-        // and the element under the mouse hasn't changed.
-        if maybe_new_target == prev_mouse_over_target.get() {
-            return;
-        }
-
-        let old_target_is_ancestor_of_new_target =
-            match (prev_mouse_over_target.get(), maybe_new_target.as_ref()) {
-                (Some(old_target), Some(new_target)) => old_target
-                    .upcast::<Node>()
-                    .is_ancestor_of(new_target.upcast::<Node>()),
-                _ => false,
-            };
+        let target_has_changed = prev_mouse_over_target
+            .get()
+            .as_ref()
+            .map_or(true, |old_target| old_target != new_target);
 
         // Here we know the target has changed, so we must update the state,
-        // dispatch mouseout to the previous one, mouseover to the new one,
-        if let Some(old_target) = prev_mouse_over_target.get() {
-            // If the old target is an ancestor of the new target, this can be skipped
-            // completely, since the node's hover state will be reseted below.
-            if !old_target_is_ancestor_of_new_target {
-                for element in old_target
+        // dispatch mouseout to the previous one, mouseover to the new one.
+        if target_has_changed {
+            // Dispatch mouseout and mouseleave to previous target.
+            if let Some(old_target) = prev_mouse_over_target.get() {
+                let old_target_is_ancestor_of_new_target = old_target
                     .upcast::<Node>()
-                    .inclusive_ancestors(ShadowIncluding::No)
-                    .filter_map(DomRoot::downcast::<Element>)
-                {
-                    element.set_hover_state(false);
-                    element.set_active_state(false);
+                    .is_ancestor_of(new_target.upcast::<Node>());
+
+                // If the old target is an ancestor of the new target, this can be skipped
+                // completely, since the node's hover state will be reset below.
+                if !old_target_is_ancestor_of_new_target {
+                    for element in old_target
+                        .upcast::<Node>()
+                        .inclusive_ancestors(ShadowIncluding::No)
+                        .filter_map(DomRoot::downcast::<Element>)
+                    {
+                        element.set_hover_state(false);
+                        element.set_active_state(false);
+                    }
+                }
+
+                self.fire_mouse_event(
+                    client_point,
+                    old_target.upcast(),
+                    FireMouseEventType::Out,
+                    EventBubbles::Bubbles,
+                    EventCancelable::Cancelable,
+                    pressed_mouse_buttons,
+                );
+
+                if !old_target_is_ancestor_of_new_target {
+                    let event_target = DomRoot::from_ref(old_target.upcast::<Node>());
+                    let moving_into = Some(DomRoot::from_ref(new_target.upcast::<Node>()));
+                    self.handle_mouse_enter_leave_event(
+                        client_point,
+                        FireMouseEventType::Leave,
+                        moving_into,
+                        event_target,
+                        pressed_mouse_buttons,
+                    );
                 }
             }
 
-            // Remove hover state to old target and its parents
-            self.fire_mouse_event(
-                client_point,
-                old_target.upcast(),
-                FireMouseEventType::Out,
-                pressed_mouse_buttons,
-            );
-
-            // TODO: Fire mouseleave here only if the old target is
-            // not an ancestor of the new target.
-        }
-
-        if let Some(ref new_target) = maybe_new_target {
+            // Dispatch mouseover and mouseenter to new target.
             for element in new_target
                 .upcast::<Node>()
                 .inclusive_ancestors(ShadowIncluding::No)
@@ -1261,31 +1478,103 @@ impl Document {
                 if element.hover_state() {
                     break;
                 }
-
                 element.set_hover_state(true);
             }
 
             self.fire_mouse_event(
                 client_point,
-                &new_target.upcast(),
+                new_target.upcast(),
                 FireMouseEventType::Over,
+                EventBubbles::Bubbles,
+                EventCancelable::Cancelable,
                 pressed_mouse_buttons,
             );
 
-            // TODO: Fire mouseenter here.
+            let moving_from = prev_mouse_over_target
+                .get()
+                .map(|old_target| DomRoot::from_ref(old_target.upcast::<Node>()));
+            let event_target = DomRoot::from_ref(new_target.upcast::<Node>());
+            self.handle_mouse_enter_leave_event(
+                client_point,
+                FireMouseEventType::Enter,
+                moving_from,
+                event_target,
+                pressed_mouse_buttons,
+            );
         }
 
-        // Store the current mouse over target for next frame.
-        prev_mouse_over_target.set(maybe_new_target.as_deref());
+        // Send mousemove event to topmost target, unless it's an iframe, in which case the
+        // compositor should have also sent an event to the inner document.
+        self.fire_mouse_event(
+            client_point,
+            new_target.upcast(),
+            FireMouseEventType::Move,
+            EventBubbles::Bubbles,
+            EventCancelable::Cancelable,
+            pressed_mouse_buttons,
+        );
 
-        self.window
-            .reflow(ReflowGoal::Full, ReflowReason::MouseEvent);
+        // If the target has changed then store the current mouse over target for next frame.
+        if target_has_changed {
+            prev_mouse_over_target.set(maybe_new_target.as_deref());
+            self.window
+                .reflow(ReflowGoal::Full, ReflowReason::MouseEvent);
+        }
+    }
+
+    fn handle_mouse_enter_leave_event(
+        &self,
+        client_point: Point2D<f32>,
+        event_type: FireMouseEventType,
+        related_target: Option<DomRoot<Node>>,
+        event_target: DomRoot<Node>,
+        pressed_mouse_buttons: u16,
+    ) {
+        assert!(matches!(
+            event_type,
+            FireMouseEventType::Enter | FireMouseEventType::Leave
+        ));
+
+        let common_ancestor = match related_target.as_ref() {
+            Some(related_target) => event_target
+                .common_ancestor(related_target, ShadowIncluding::No)
+                .unwrap_or_else(|| DomRoot::from_ref(&*event_target)),
+            None => DomRoot::from_ref(&*event_target),
+        };
+
+        // We need to create a target chain in case the event target shares
+        // its boundaries with its ancestors.
+        let mut targets = vec![];
+        let mut current = Some(event_target);
+        while let Some(node) = current {
+            if node == common_ancestor {
+                break;
+            }
+            current = node.GetParentNode();
+            targets.push(node);
+        }
+
+        // The order for dispatching mouseenter events starts from the topmost
+        // common ancestor of the event target and the related target.
+        if event_type == FireMouseEventType::Enter {
+            targets = targets.into_iter().rev().collect();
+        }
+
+        for target in targets {
+            self.fire_mouse_event(
+                client_point,
+                target.upcast(),
+                event_type,
+                EventBubbles::DoesNotBubble,
+                EventCancelable::NotCancelable,
+                pressed_mouse_buttons,
+            );
+        }
     }
 
     #[allow(unsafe_code)]
-    pub fn handle_wheel_event(
+    pub unsafe fn handle_wheel_event(
         &self,
-        js_runtime: *mut JSRuntime,
         delta: WheelDelta,
         client_point: Point2D<f32>,
         node_address: Option<UntrustedNodeAddress>,
@@ -1294,7 +1583,7 @@ impl Document {
         debug!("{}: at {:?}", wheel_event_type_string, client_point);
 
         let el = node_address.and_then(|address| {
-            let node = unsafe { node::from_untrusted_node_address(js_runtime, address) };
+            let node = node::from_untrusted_node_address(address);
             node.inclusive_ancestors(ShadowIncluding::No)
                 .filter_map(DomRoot::downcast::<Element>)
                 .next()
@@ -1330,9 +1619,8 @@ impl Document {
     }
 
     #[allow(unsafe_code)]
-    pub fn handle_touch_event(
+    pub unsafe fn handle_touch_event(
         &self,
-        js_runtime: *mut JSRuntime,
         event_type: TouchEventType,
         touch_id: TouchId,
         point: Point2D<f32>,
@@ -1348,7 +1636,7 @@ impl Document {
         };
 
         let el = node_address.and_then(|address| {
-            let node = unsafe { node::from_untrusted_node_address(js_runtime, address) };
+            let node = node::from_untrusted_node_address(address);
             node.inclusive_ancestors(ShadowIncluding::No)
                 .filter_map(DomRoot::downcast::<Element>)
                 .next()
@@ -1420,7 +1708,7 @@ impl Document {
             Some(window),
             0i32,
             &touches,
-            &TouchList::new(window, ref_slice(&&*touch)),
+            &TouchList::new(window, from_ref(&&*touch)),
             &TouchList::new(window, target_touches.r()),
             // FIXME: modifier keys
             false,
@@ -1518,6 +1806,13 @@ impl Document {
         }
 
         self.window.reflow(ReflowGoal::Full, ReflowReason::KeyEvent);
+    }
+
+    pub fn ime_dismissed(&self) {
+        self.request_focus(
+            self.GetBody().as_ref().map(|e| &*e.upcast()),
+            FocusType::Element,
+        )
     }
 
     pub fn dispatch_composition_event(
@@ -1758,6 +2053,7 @@ impl Document {
         fetch_target: IpcSender<FetchResponseMsg>,
     ) {
         request.csp_list = self.get_csp_list().map(|x| x.clone());
+        request.https_state = self.https_state.get();
         let mut loader = self.loader.borrow_mut();
         loader.fetch_async(load, request, fetch_target);
     }
@@ -2064,6 +2360,17 @@ impl Document {
 
         // Step 11.
         // TODO: ready for post-load tasks.
+
+        // The dom.webxr.sessionavailable pref allows webxr
+        // content to immediately begin a session without waiting for a user gesture.
+        // TODO: should this only happen on the first document loaded?
+        // https://immersive-web.github.io/webxr/#user-intention
+        // https://github.com/immersive-web/navigation/issues/10
+        if pref!(dom.webxr.sessionavailable) {
+            if self.window.is_top_level() {
+                self.window.Navigator().Xr().dispatch_sessionavailable();
+            }
+        }
 
         // Step 12: completely loaded.
         // https://html.spec.whatwg.org/multipage/#completely-loaded
@@ -2513,20 +2820,20 @@ impl Document {
         }
     }
 
-    pub fn add_dirty_canvas(&self, context: &WebGLRenderingContext) {
+    pub fn add_dirty_webgl_canvas(&self, context: &WebGLRenderingContext) {
         self.dirty_webgl_contexts
             .borrow_mut()
             .entry(context.context_id())
             .or_insert_with(|| Dom::from_ref(context));
     }
 
-    pub fn flush_dirty_canvases(&self) {
+    pub fn flush_dirty_webgl_canvases(&self) {
         let dirty_context_ids: Vec<_> = self
             .dirty_webgl_contexts
             .borrow_mut()
             .drain()
             .filter(|(_, context)| context.onscreen())
-            .map(|(id, _)| SwapChainId::Context(id))
+            .map(|(id, _)| id)
             .collect();
 
         if dirty_context_ids.is_empty() {
@@ -2546,6 +2853,21 @@ impl Document {
             .send(WebGLMsg::SwapBuffers(dirty_context_ids, sender, time))
             .unwrap();
         receiver.recv().unwrap();
+    }
+
+    pub fn add_dirty_webgpu_canvas(&self, context: &GPUCanvasContext) {
+        self.dirty_webgpu_contexts
+            .borrow_mut()
+            .entry(context.context_id())
+            .or_insert_with(|| Dom::from_ref(context));
+    }
+
+    #[allow(unrooted_must_root)]
+    pub fn flush_dirty_webgpu_canvases(&self) {
+        self.dirty_webgpu_contexts
+            .borrow_mut()
+            .drain()
+            .for_each(|(_, context)| context.send_swap_chain_present());
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:supported-property-names
@@ -2850,7 +3172,7 @@ impl Document {
             stylesheet_list: MutNullableDom::new(None),
             ready_state: Cell::new(ready_state),
             domcontentloaded_dispatched: Cell::new(domcontentloaded_dispatched),
-            possibly_focused: Default::default(),
+            focus_transaction: DomRefCell::new(FocusTransaction::NotInTransaction),
             focused: Default::default(),
             current_script: Default::default(),
             pending_parsing_blocking_script: Default::default(),
@@ -2909,6 +3231,7 @@ impl Document {
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
             dirty_webgl_contexts: DomRefCell::new(HashMap::new()),
+            dirty_webgpu_contexts: DomRefCell::new(HashMap::new()),
             csp_list: DomRefCell::new(None),
             selection: MutNullableDom::new(None),
             animation_timeline: if pref!(layout.animations.test.enabled) {
@@ -2917,6 +3240,7 @@ impl Document {
                 DomRefCell::new(AnimationTimeline::new())
             },
             animations: DomRefCell::new(Animations::new()),
+            dirty_root: Default::default(),
         }
     }
 
@@ -3143,7 +3467,12 @@ impl Document {
         let window_size = self.window().window_size();
         let viewport_size = window_size.initial_viewport;
         let device_pixel_ratio = window_size.device_pixel_ratio;
-        Device::new(MediaType::screen(), viewport_size, device_pixel_ratio)
+        Device::new(
+            MediaType::screen(),
+            self.quirks_mode(),
+            viewport_size,
+            device_pixel_ratio,
+        )
     }
 
     pub fn salvageable(&self) -> bool {
@@ -3200,7 +3529,7 @@ impl Document {
     pub fn element_state_will_change(&self, el: &Element) {
         let mut entry = self.ensure_pending_restyle(el);
         if entry.snapshot.is_none() {
-            entry.snapshot = Some(Snapshot::new(el.html_element_in_html_document()));
+            entry.snapshot = Some(Snapshot::new());
         }
         let snapshot = entry.snapshot.as_mut().unwrap();
         if snapshot.state.is_none() {
@@ -3216,7 +3545,7 @@ impl Document {
         // could in theory do it in the DOM I think.
         let mut entry = self.ensure_pending_restyle(el);
         if entry.snapshot.is_none() {
-            entry.snapshot = Some(Snapshot::new(el.html_element_in_html_document()));
+            entry.snapshot = Some(Snapshot::new());
         }
         if attr.local_name() == &local_name!("style") {
             entry.hint.insert(RestyleHint::RESTYLE_STYLE_ATTRIBUTE);
@@ -3228,11 +3557,21 @@ impl Document {
 
         let snapshot = entry.snapshot.as_mut().unwrap();
         if attr.local_name() == &local_name!("id") {
+            if snapshot.id_changed {
+                return;
+            }
             snapshot.id_changed = true;
         } else if attr.local_name() == &local_name!("class") {
+            if snapshot.class_changed {
+                return;
+            }
             snapshot.class_changed = true;
         } else {
             snapshot.other_attributes_changed = true;
+        }
+        let local_name = style::LocalName::cast(attr.local_name());
+        if !snapshot.changed_attrs.contains(local_name) {
+            snapshot.changed_attrs.push(local_name.clone());
         }
         if snapshot.attrs.is_none() {
             let attrs = el
@@ -3496,13 +3835,15 @@ impl Document {
             })
             .cloned();
 
-        self.window
-            .layout_chan()
-            .send(Msg::AddStylesheet(
-                sheet.clone(),
-                insertion_point.as_ref().map(|s| s.sheet.clone()),
-            ))
-            .unwrap();
+        match self.window.layout_chan() {
+            Some(chan) => chan
+                .send(Msg::AddStylesheet(
+                    sheet.clone(),
+                    insertion_point.as_ref().map(|s| s.sheet.clone()),
+                ))
+                .unwrap(),
+            None => return warn!("Layout channel unavailable"),
+        }
 
         DocumentOrShadowRoot::add_stylesheet(
             owner,
@@ -3516,10 +3857,10 @@ impl Document {
     /// Remove a stylesheet owned by `owner` from the list of document sheets.
     #[allow(unrooted_must_root)] // Owner needs to be rooted already necessarily.
     pub fn remove_stylesheet(&self, owner: &Element, s: &Arc<Stylesheet>) {
-        self.window
-            .layout_chan()
-            .send(Msg::RemoveStylesheet(s.clone()))
-            .unwrap();
+        match self.window.layout_chan() {
+            Some(chan) => chan.send(Msg::RemoveStylesheet(s.clone())).unwrap(),
+            None => return warn!("Layout channel unavailable"),
+        }
 
         DocumentOrShadowRoot::remove_stylesheet(
             owner,
@@ -3621,10 +3962,24 @@ impl Document {
 
     pub(crate) fn advance_animation_timeline_for_testing(&self, delta: f64) {
         self.animation_timeline.borrow_mut().advance_specific(delta);
+        let current_timeline_value = self.current_animation_timeline_value();
+        self.animations
+            .borrow()
+            .update_for_new_timeline_value(&self.window, current_timeline_value);
     }
 
     pub(crate) fn update_animation_timeline(&self) {
-        self.animation_timeline.borrow_mut().update();
+        // Only update the time if it isn't being managed by a test.
+        if !pref!(layout.animations.test.enabled) {
+            self.animation_timeline.borrow_mut().update();
+        }
+
+        // We still want to update the animations, because our timeline
+        // value might have been advanced previously via the TestBinding.
+        let current_timeline_value = self.current_animation_timeline_value();
+        self.animations
+            .borrow()
+            .update_for_new_timeline_value(&self.window, current_timeline_value);
     }
 
     pub(crate) fn current_animation_timeline_value(&self) -> f64 {
@@ -3635,10 +3990,14 @@ impl Document {
         self.animations.borrow()
     }
 
-    pub(crate) fn update_animations(&self) -> AnimationsUpdate {
+    pub(crate) fn update_animations_post_reflow(&self) {
         self.animations
-            .borrow_mut()
-            .do_post_reflow_update(&self.window, self.current_animation_timeline_value())
+            .borrow()
+            .do_post_reflow_update(&self.window, self.current_animation_timeline_value());
+    }
+
+    pub(crate) fn cancel_animations_for_node(&self, node: &Node) {
+        self.animations.borrow().cancel_animations_for_node(node);
     }
 }
 
@@ -3669,6 +4028,11 @@ impl ProfilerMetadataFactory for Document {
 }
 
 impl DocumentMethods for Document {
+    // https://w3c.github.io/editing/ActiveDocuments/execCommand.html#querycommandsupported()
+    fn QueryCommandSupported(&self, _command: DOMString) -> bool {
+        false
+    }
+
     // https://drafts.csswg.org/cssom/#dom-document-stylesheets
     fn StyleSheets(&self) -> DomRoot<StyleSheetList> {
         self.stylesheet_list.or_init(|| {
@@ -4406,6 +4770,11 @@ impl DocumentMethods for Document {
     // https://dom.spec.whatwg.org/#dom-parentnode-append
     fn Append(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
         self.upcast::<Node>().append(nodes)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
+    fn ReplaceChildren(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
+        self.upcast::<Node>().replace_children(nodes)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-queryselector

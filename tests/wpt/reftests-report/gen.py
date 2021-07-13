@@ -4,6 +4,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import gzip
 import json
 import os
 import re
@@ -20,7 +21,13 @@ def fetch(url):
     print("Fetching " + url)
     response = urllib.request.urlopen(url)
     assert response.getcode() == 200
-    return response
+    encoding = response.info().get("Content-Encoding")
+    if not encoding:
+        return response
+    elif encoding == "gzip":
+        return gzip.GzipFile(fileobj=response)
+    else:
+        raise ValueError("Unsupported Content-Encoding: %s" % encoding)
 
 
 def fetch_json(url):
@@ -62,7 +69,7 @@ def main(source, commit_sha=None):
 
     if commit_sha:
         title = "<h1>Layout 2020 regressions in commit <code>%s</code></h1>" % commit_sha
-        failures_2013 = {url for url, _ in failing_reftests("linux_x64", source)}
+        failures_2013 = {url for url, _, _ in failing_reftests("linux_x64", source)}
         for url, _expected_pass, screenshots in failing_reftests("linux_x64_2020", source):
             if url not in failures_2013:
                 failures.add(url, screenshots)

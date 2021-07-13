@@ -5,9 +5,9 @@
 //! Generic types for font stuff.
 
 use crate::parser::{Parse, ParserContext};
+use crate::One;
 use byteorder::{BigEndian, ReadBytesExt};
 use cssparser::Parser;
-use num_traits::One;
 use std::fmt::{self, Write};
 use std::io::Cursor;
 use style_traits::{CssWriter, ParseError};
@@ -42,7 +42,7 @@ where
     {
         self.tag.to_css(dest)?;
         // Don't serialize the default value.
-        if self.value != Integer::one() {
+        if !self.value.is_one() {
             dest.write_char(' ')?;
             self.value.to_css(dest)?;
         }
@@ -77,7 +77,6 @@ pub struct VariationValue<Number> {
 }
 
 /// A value both for font-variation-settings and font-feature-settings.
-#[css(comma)]
 #[derive(
     Clone,
     Debug,
@@ -90,6 +89,7 @@ pub struct VariationValue<Number> {
     ToResolvedValue,
     ToShmem,
 )]
+#[css(comma)]
 pub struct FontSettings<T>(#[css(if_empty = "normal", iterable)] pub Box<[T]>);
 
 impl<T> FontSettings<T> {
@@ -107,7 +107,10 @@ impl<T: Parse> Parse for FontSettings<T> {
         context: &ParserContext,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self, ParseError<'i>> {
-        if input.try(|i| i.expect_ident_matching("normal")).is_ok() {
+        if input
+            .try_parse(|i| i.expect_ident_matching("normal"))
+            .is_ok()
+        {
             return Ok(Self::normal());
         }
 

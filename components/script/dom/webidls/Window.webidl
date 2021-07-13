@@ -136,9 +136,14 @@ partial interface Window {
 
 // Proprietary extensions.
 partial interface Window {
+  [Pref="dom.servo_helpers.enabled"]
   void debug(DOMString arg);
+  [Pref="dom.servo_helpers.enabled"]
   void gc();
+  [Pref="dom.servo_helpers.enabled"]
   void trap();
+  [Pref="dom.servo_helpers.enabled"]
+  void js_backtrace();
 };
 
 // WebDriver extensions
@@ -180,6 +185,10 @@ partial interface Window {
    Selection? getSelection();
 };
 
+// https://dom.spec.whatwg.org/#interface-window-extensions
+partial interface Window {
+  [Replaceable] readonly attribute any event; // historical
+};
 
 dictionary WindowPostMessageOptions : PostMessageOptions {
    USVString targetOrigin = "/";

@@ -7,7 +7,12 @@
 interface GPUComputePassEncoder {
     void setPipeline(GPUComputePipeline pipeline);
     void dispatch(GPUSize32 x, optional GPUSize32 y = 1, optional GPUSize32 z = 1);
-    // void dispatchIndirect(GPUBuffer indirectBuffer, GPUBufferSize indirectOffset);
+    void dispatchIndirect(GPUBuffer indirectBuffer, GPUSize64 indirectOffset);
+
+    //void beginPipelineStatisticsQuery(GPUQuerySet querySet, GPUSize32 queryIndex);
+    //void endPipelineStatisticsQuery();
+
+    //void writeTimestamp(GPUQuerySet querySet, GPUSize32 queryIndex);
 
     void endPass();
 };

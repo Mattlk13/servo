@@ -113,12 +113,7 @@ macro_rules! impl_from_pref {
                     if let $variant(value) = other {
                         value.into()
                     } else {
-                        panic!(
-                            format!("Cannot convert {:?} to {:?}",
-                                other,
-                                std::any::type_name::<$t>()
-                            )
-                        );
+                        panic!("Cannot convert {:?} to {:?}", other, std::any::type_name::<$t>())
                     }
                 }
             }
@@ -217,6 +212,17 @@ impl<'m, P: Clone> Preferences<'m, P> {
             (accessor.getter)(&prefs)
         } else {
             PrefValue::Missing
+        }
+    }
+
+    /// Has the preference been modified from its original value?
+    pub fn is_default(&self, key: &str) -> Result<bool, PrefError> {
+        if let Some(accessor) = self.accessors.get(key) {
+            let user = (accessor.getter)(&self.default_prefs);
+            let default = (accessor.getter)(&self.user_prefs.read().unwrap());
+            Ok(default == user)
+        } else {
+            Err(PrefError::NoSuchPref(String::from(key)))
         }
     }
 

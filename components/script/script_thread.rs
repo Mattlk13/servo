@@ -17,26 +17,18 @@
 //! a page runs its course and the script thread returns to processing events in the main event
 //! loop.
 
-use crate::animations::{
-    AnimationsUpdate, TransitionOrAnimationEvent, TransitionOrAnimationEventType,
-};
 use crate::devtools;
 use crate::document_loader::DocumentLoader;
-use crate::dom::animationevent::AnimationEvent;
 use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::AnimationEventBinding::AnimationEventInit;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
-use crate::dom::bindings::codegen::Bindings::EventBinding::EventInit;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
-use crate::dom::bindings::codegen::Bindings::TransitionEventBinding::TransitionEventInit;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::conversions::{
     ConversionResult, FromJSValConvertible, StringificationBehavior,
 };
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::ThreadLocalStackRoots;
@@ -55,28 +47,27 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::htmliframeelement::{HTMLIFrameElement, NavigationType};
+use crate::dom::identityhub::Identities;
 use crate::dom::mutationobserver::MutationObserver;
-use crate::dom::node::{
-    from_untrusted_node_address, window_from_node, Node, NodeDamage, ShadowIncluding,
-};
+use crate::dom::node::{window_from_node, Node, ShadowIncluding};
 use crate::dom::performanceentry::PerformanceEntry;
 use crate::dom::performancepainttiming::PerformancePaintTiming;
 use crate::dom::serviceworker::TrustedServiceWorkerAddress;
-use crate::dom::serviceworkerregistration::ServiceWorkerRegistration;
 use crate::dom::servoparser::{ParserContext, ServoParser};
-use crate::dom::transitionevent::TransitionEvent;
 use crate::dom::uievent::UIEvent;
 use crate::dom::window::{ReflowReason, Window};
-use crate::dom::windowproxy::WindowProxy;
+use crate::dom::windowproxy::{CreatorBrowsingContextInfo, WindowProxy};
 use crate::dom::worker::TrustedWorkerAddress;
 use crate::dom::worklet::WorkletThreadPool;
 use crate::dom::workletglobalscope::WorkletGlobalScopeInit;
 use crate::fetch::FetchCanceller;
 use crate::microtask::{Microtask, MicrotaskQueue};
 use crate::realms::enter_realm;
-use crate::script_runtime::{get_reports, new_rt_and_cx, JSContext, Runtime, ScriptPort};
+use crate::script_module::ScriptFetchOptions;
+use crate::script_runtime::{
+    get_reports, new_rt_and_cx, ContextForRequestInterrupt, JSContext, Runtime, ScriptPort,
+};
 use crate::script_runtime::{CommonScriptMsg, ScriptChan, ScriptThreadEventCategory};
-use crate::serviceworkerjob::{Job, JobQueue};
 use crate::task_manager::TaskManager;
 use crate::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
 use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
@@ -109,14 +100,17 @@ use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use js::glue::GetWindowProxyClass;
 use js::jsapi::JS_SetWrapObjectCallbacks;
-use js::jsapi::{JSTracer, SetWindowProxyClass};
+use js::jsapi::{
+    JSContext as UnsafeJSContext, JSTracer, JS_AddInterruptCallback, SetWindowProxyClass,
+};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
 use media::WindowGLContext;
 use metrics::{PaintTimeMetrics, MAX_TASK_NS};
 use mime::{self, Mime};
 use msg::constellation_msg::{
-    BackgroundHangMonitor, BackgroundHangMonitorRegister, ScriptHangAnnotation,
+    BackgroundHangMonitor, BackgroundHangMonitorExitSignal, BackgroundHangMonitorRegister,
+    ScriptHangAnnotation,
 };
 use msg::constellation_msg::{BrowsingContextId, HistoryStateId, PipelineId};
 use msg::constellation_msg::{HangAnnotation, MonitoredComponentId, MonitoredComponentType};
@@ -129,14 +123,15 @@ use net_traits::{
     Metadata, NetworkError, ReferrerPolicy, ResourceFetchTiming, ResourceThreads,
     ResourceTimingType,
 };
+use parking_lot::Mutex;
 use percent_encoding::percent_decode;
 use profile_traits::mem::{self as profile_mem, OpaqueSender, ReportsChan};
 use profile_traits::time::{self as profile_time, profile, ProfilerCategory};
 use script_layout_interface::message::{self, LayoutThreadInit, Msg, ReflowGoal};
 use script_traits::webdriver_msg::WebDriverScriptCommand;
 use script_traits::CompositorEvent::{
-    CompositionEvent, KeyboardEvent, MouseButtonEvent, MouseMoveEvent, ResizeEvent, TouchEvent,
-    WheelEvent,
+    CompositionEvent, IMEDismissedEvent, KeyboardEvent, MouseButtonEvent, MouseMoveEvent,
+    ResizeEvent, TouchEvent, WheelEvent,
 };
 use script_traits::{
     AnimationTickType, CompositorEvent, ConstellationControlMsg, DiscardBrowsingContext,
@@ -149,7 +144,6 @@ use script_traits::{
 };
 use servo_atoms::Atom;
 use servo_config::opts;
-use servo_config::pref;
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -161,7 +155,7 @@ use std::option::Option;
 use std::ptr;
 use std::rc::Rc;
 use std::result::Result;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -169,6 +163,7 @@ use style::dom::OpaqueNode;
 use style::thread_state::{self, ThreadState};
 use time::{at_utc, get_time, precise_time_ns, Timespec};
 use url::Position;
+use webgpu::identity::WebGPUMsg;
 use webrender_api::units::LayoutPixel;
 use webrender_api::DocumentId;
 
@@ -221,6 +216,8 @@ struct InProgressLoad {
     canceller: FetchCanceller,
     /// Flag for sharing with the layout thread that is not yet created.
     layout_is_busy: Arc<AtomicBool>,
+    /// If inheriting the security context
+    inherited_secure_context: Option<bool>,
 }
 
 impl InProgressLoad {
@@ -236,6 +233,7 @@ impl InProgressLoad {
         url: ServoUrl,
         origin: MutableOrigin,
         layout_is_busy: Arc<AtomicBool>,
+        inherited_secure_context: Option<bool>,
     ) -> InProgressLoad {
         let current_time = get_time();
         let navigation_start_precise = precise_time_ns();
@@ -258,6 +256,7 @@ impl InProgressLoad {
             navigation_start_precise: navigation_start_precise,
             canceller: Default::default(),
             layout_is_busy: layout_is_busy,
+            inherited_secure_context: inherited_secure_context,
         }
     }
 }
@@ -268,6 +267,7 @@ enum MixedMessage {
     FromScript(MainThreadScriptMsg),
     FromDevtools(DevtoolScriptControlMsg),
     FromImageCache((PipelineId, PendingImageResponse)),
+    FromWebGPUServer(WebGPUMsg),
 }
 
 /// Messages used to control the script event loop.
@@ -285,8 +285,6 @@ pub enum MainThreadScriptMsg {
         properties: Vec<Atom>,
         painter: Box<dyn Painter>,
     },
-    /// Dispatches a job queue.
-    DispatchJobQueue { scope_url: ServoUrl },
     /// A task related to a not fully-active document has been throttled.
     Inactive,
     /// Wake-up call from the task queue.
@@ -512,7 +510,7 @@ impl<'a> Iterator for DocumentsIter<'a> {
 // which can trigger GC, and so we can end up tracing the script
 // thread during parsing. For this reason, we don't trace the
 // incomplete parser contexts during GC.
-type IncompleteParserContexts = Vec<(PipelineId, ParserContext)>;
+pub struct IncompleteParserContexts(RefCell<Vec<(PipelineId, ParserContext)>>);
 
 unsafe_no_jsmanaged_fields!(TaskQueue<MainThreadScriptMsg>);
 unsafe_no_jsmanaged_fields!(dyn BackgroundHangMonitorRegister);
@@ -530,11 +528,7 @@ pub struct ScriptThread {
     /// A list of data pertaining to loads that have not yet received a network response
     incomplete_loads: DomRefCell<Vec<InProgressLoad>>,
     /// A vector containing parser contexts which have not yet been fully processed
-    incomplete_parser_contexts: RefCell<IncompleteParserContexts>,
-    /// A map to store service worker registrations for a given origin
-    registration_map: DomRefCell<HashMap<ServoUrl, Dom<ServiceWorkerRegistration>>>,
-    /// A job queue for Service Workers keyed by their scope url
-    job_queue_map: Rc<JobQueue>,
+    incomplete_parser_contexts: IncompleteParserContexts,
     /// Image cache for this script thread.
     image_cache: Arc<dyn ImageCache>,
     /// A handle to the resource thread. This is an `Arc` to avoid running out of file descriptors if
@@ -547,9 +541,11 @@ pub struct ScriptThread {
     task_queue: TaskQueue<MainThreadScriptMsg>,
 
     /// A handle to register associated layout threads for hang-monitoring.
-    background_hang_monitor_register: Option<Box<dyn BackgroundHangMonitorRegister>>,
+    background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
     /// The dedicated means of communication with the background-hang-monitor for this script-thread.
-    background_hang_monitor: Option<Box<dyn BackgroundHangMonitor>>,
+    background_hang_monitor: Box<dyn BackgroundHangMonitor>,
+    /// A flag set to `true` by the BHM on exit, and checked from within the interrupt handler.
+    closing: Arc<AtomicBool>,
 
     /// A channel to hand out to script thread-based entities that need to be able to enqueue
     /// events in the event queue.
@@ -641,13 +637,6 @@ pub struct ScriptThread {
     /// resources during a turn of the event loop.
     docs_with_no_blocking_loads: DomRefCell<HashSet<Dom<Document>>>,
 
-    /// A list of nodes with in-progress CSS transitions, which roots them for the duration
-    /// of the transition.
-    animating_nodes: DomRefCell<HashMap<PipelineId, Vec<Dom<Node>>>>,
-
-    /// Animations events that are pending to be sent.
-    animation_events: RefCell<Vec<TransitionOrAnimationEvent>>,
-
     /// <https://html.spec.whatwg.org/multipage/#custom-element-reactions-stack>
     custom_element_reaction_stack: CustomElementReactionStack,
 
@@ -671,6 +660,9 @@ pub struct ScriptThread {
 
     /// Unminify Javascript.
     unminify_js: bool,
+
+    /// Directory with stored unminified scripts
+    local_script_source: Option<String>,
 
     /// Where to load userscripts from, if any. An empty string will load from
     /// the resources/user-agent-js directory, and if the option isn't passed userscripts
@@ -698,6 +690,36 @@ pub struct ScriptThread {
 
     /// Code is running as a consequence of a user interaction
     is_user_interacting: Cell<bool>,
+
+    /// Identity manager for WebGPU resources
+    gpu_id_hub: Arc<Mutex<Identities>>,
+
+    /// Receiver to receive commands from optional WebGPU server.
+    webgpu_port: RefCell<Option<Receiver<WebGPUMsg>>>,
+
+    // Secure context
+    inherited_secure_context: Option<bool>,
+}
+
+struct BHMExitSignal {
+    closing: Arc<AtomicBool>,
+    js_context: ContextForRequestInterrupt,
+}
+
+impl BackgroundHangMonitorExitSignal for BHMExitSignal {
+    fn signal_to_exit(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        self.js_context.request_interrupt();
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn interrupt_callback(_cx: *mut UnsafeJSContext) -> bool {
+    let res = ScriptThread::can_continue_running();
+    if !res {
+        ScriptThread::prepare_for_shutdown();
+    }
+    res
 }
 
 /// In the event of thread panic, all data on the stack runs its destructor. However, there
@@ -740,6 +762,7 @@ impl ScriptThreadFactory for ScriptThread {
         relayout_event: bool,
         prepare_for_screenshot: bool,
         unminify_js: bool,
+        local_script_source: Option<String>,
         userscripts_path: Option<String>,
         headless: bool,
         replace_surrogates: bool,
@@ -762,6 +785,7 @@ impl ScriptThreadFactory for ScriptThread {
                 let top_level_browsing_context_id = state.top_level_browsing_context_id;
                 let parent_info = state.parent_info;
                 let opener = state.opener;
+                let secure = load_data.inherited_secure_context.clone();
                 let mem_profiler_chan = state.mem_profiler_chan.clone();
                 let window_size = state.window_size;
                 let layout_is_busy = state.layout_is_busy.clone();
@@ -775,6 +799,7 @@ impl ScriptThreadFactory for ScriptThread {
                     relayout_event,
                     prepare_for_screenshot,
                     unminify_js,
+                    local_script_source,
                     userscripts_path,
                     headless,
                     replace_surrogates,
@@ -799,6 +824,7 @@ impl ScriptThreadFactory for ScriptThread {
                     load_data.url.clone(),
                     origin,
                     layout_is_busy,
+                    secure,
                 );
                 script_thread.pre_page_load(new_load, load_data);
 
@@ -830,37 +856,17 @@ impl ScriptThread {
         })
     }
 
-    /// Consume the list of pointer addresses corresponding to DOM nodes that are animating
-    /// and root them in a per-pipeline list of nodes.
-    ///
-    /// Unsafety: any pointer to invalid memory (ie. a GCed node) will trigger a crash.
-    /// TODO: ensure caller uses rooted nodes instead of unsafe node addresses.
-    pub(crate) unsafe fn process_animations_update(mut update: AnimationsUpdate) {
-        if update.is_empty() {
-            return;
-        }
-
+    pub fn can_continue_running() -> bool {
         SCRIPT_THREAD_ROOT.with(|root| {
-            let script_thread = &*root.get().unwrap();
+            let script_thread = unsafe { &*root.get().unwrap() };
+            script_thread.can_continue_running_inner()
+        })
+    }
 
-            if !update.events.is_empty() {
-                script_thread
-                    .animation_events
-                    .borrow_mut()
-                    .append(&mut update.events);
-            }
-
-            let js_runtime = script_thread.js_runtime.rt();
-            let new_nodes = update
-                .newly_animating_nodes
-                .into_iter()
-                .map(|n| Dom::from_ref(&*from_untrusted_node_address(js_runtime, n)));
-            script_thread
-                .animating_nodes
-                .borrow_mut()
-                .entry(update.pipeline_id)
-                .or_insert_with(Vec::new)
-                .extend(new_nodes);
+    pub fn prepare_for_shutdown() {
+        SCRIPT_THREAD_ROOT.with(|root| {
+            let script_thread = unsafe { &*root.get().unwrap() };
+            script_thread.prepare_for_shutdown_inner();
         })
     }
 
@@ -922,22 +928,22 @@ impl ScriptThread {
         })
     }
 
-    #[allow(unrooted_must_root)]
-    pub fn schedule_job(job: Job) {
-        SCRIPT_THREAD_ROOT.with(|root| {
-            let script_thread = unsafe { &*root.get().unwrap() };
-            let job_queue = &*script_thread.job_queue_map;
-            job_queue.schedule_job(job, &script_thread);
-        });
-    }
-
-    pub fn process_event(msg: CommonScriptMsg) {
+    /// Process a single event as if it were the next event
+    /// in the queue for this window event-loop.
+    /// Returns a boolean indicating whether further events should be processed.
+    pub fn process_event(msg: CommonScriptMsg) -> bool {
         SCRIPT_THREAD_ROOT.with(|root| {
             if let Some(script_thread) = root.get() {
                 let script_thread = unsafe { &*script_thread };
-                script_thread.handle_msg_from_script(MainThreadScriptMsg::Common(msg));
+                if !script_thread.can_continue_running_inner() {
+                    return false;
+                } else {
+                    script_thread.handle_msg_from_script(MainThreadScriptMsg::Common(msg));
+                    return true;
+                }
             }
-        });
+            false
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#await-a-stable-state
@@ -1151,6 +1157,8 @@ impl ScriptThread {
                         image_cache: script_thread.image_cache.clone(),
                         is_headless: script_thread.headless,
                         user_agent: script_thread.user_agent.clone(),
+                        gpu_id_hub: script_thread.gpu_id_hub.clone(),
+                        inherited_secure_context: script_thread.inherited_secure_context.clone(),
                     };
                     Rc::new(WorkletThreadPool::spawn(init))
                 })
@@ -1175,9 +1183,13 @@ impl ScriptThread {
                 );
             },
         };
-        let _ = window
-            .layout_chan()
-            .send(Msg::RegisterPaint(name, properties, painter));
+
+        match window.layout_chan() {
+            Some(chan) => chan
+                .send(Msg::RegisterPaint(name, properties, painter))
+                .unwrap(),
+            None => warn!("Layout channel unavailable"),
+        }
     }
 
     pub fn push_new_element_queue() {
@@ -1268,6 +1280,7 @@ impl ScriptThread {
         relayout_event: bool,
         prepare_for_screenshot: bool,
         unminify_js: bool,
+        local_script_source: Option<String>,
         userscripts_path: Option<String>,
         headless: bool,
         replace_surrogates: bool,
@@ -1284,6 +1297,7 @@ impl ScriptThread {
         unsafe {
             JS_SetWrapObjectCallbacks(cx, &WRAP_CALLBACKS);
             SetWindowProxyClass(cx, GetWindowProxyClass());
+            JS_AddInterruptCallback(cx, Some(interrupt_callback));
         }
 
         // Ask the router to proxy IPC messages from the devtools to us.
@@ -1295,13 +1309,18 @@ impl ScriptThread {
 
         let task_queue = TaskQueue::new(port, chan.clone());
 
-        let background_hang_monitor = state.background_hang_monitor_register.clone().map(|bhm| {
-            bhm.register_component(
-                MonitoredComponentId(state.id.clone(), MonitoredComponentType::Script),
-                Duration::from_millis(1000),
-                Duration::from_millis(5000),
-            )
-        });
+        let closing = Arc::new(AtomicBool::new(false));
+        let background_hang_monitor_exit_signal = BHMExitSignal {
+            closing: closing.clone(),
+            js_context: ContextForRequestInterrupt::new(cx),
+        };
+
+        let background_hang_monitor = state.background_hang_monitor_register.register_component(
+            MonitoredComponentId(state.id.clone(), MonitoredComponentType::Script),
+            Duration::from_millis(1000),
+            Duration::from_millis(5000),
+            Some(Box::new(background_hang_monitor_exit_signal)),
+        );
 
         // Ask the router to proxy IPC messages from the control port to us.
         let control_port = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(state.control_port);
@@ -1310,9 +1329,7 @@ impl ScriptThread {
             documents: DomRefCell::new(Documents::new()),
             window_proxies: DomRefCell::new(HashMap::new()),
             incomplete_loads: DomRefCell::new(vec![]),
-            incomplete_parser_contexts: RefCell::new(vec![]),
-            registration_map: DomRefCell::new(HashMap::new()),
-            job_queue_map: Rc::new(JobQueue::new()),
+            incomplete_parser_contexts: IncompleteParserContexts(RefCell::new(vec![])),
 
             image_cache: state.image_cache.clone(),
             image_cache_channel: image_cache_channel,
@@ -1325,6 +1342,7 @@ impl ScriptThread {
 
             background_hang_monitor_register: state.background_hang_monitor_register,
             background_hang_monitor,
+            closing,
 
             chan: MainThreadScriptChan(chan.clone()),
             dom_manipulation_task_sender: boxed_script_sender.clone(),
@@ -1372,9 +1390,6 @@ impl ScriptThread {
 
             docs_with_no_blocking_loads: Default::default(),
 
-            animating_nodes: Default::default(),
-            animation_events: Default::default(),
-
             custom_element_reaction_stack: CustomElementReactionStack::new(),
 
             webrender_document: state.webrender_document,
@@ -1386,6 +1401,7 @@ impl ScriptThread {
             relayout_event,
             prepare_for_screenshot,
             unminify_js,
+            local_script_source,
 
             userscripts_path,
             headless,
@@ -1396,12 +1412,32 @@ impl ScriptThread {
 
             node_ids: Default::default(),
             is_user_interacting: Cell::new(false),
+            gpu_id_hub: Arc::new(Mutex::new(Identities::new())),
+            webgpu_port: RefCell::new(None),
+            inherited_secure_context: state.inherited_secure_context,
         }
     }
 
     #[allow(unsafe_code)]
     pub fn get_cx(&self) -> JSContext {
         unsafe { JSContext::from_ptr(self.js_runtime.cx()) }
+    }
+
+    /// Check if we are closing.
+    fn can_continue_running_inner(&self) -> bool {
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        true
+    }
+
+    /// We are closing, ensure no script can run and potentially hang.
+    fn prepare_for_shutdown_inner(&self) {
+        let docs = self.documents.borrow();
+        for (_, document) in docs.iter() {
+            let window = document.window();
+            window.ignore_all_tasks();
+        }
     }
 
     /// Starts the script thread. After calling this method, the script thread will loop receiving
@@ -1418,7 +1454,9 @@ impl ScriptThread {
     /// Handle incoming control messages.
     fn handle_msgs(&self) -> bool {
         use self::MixedMessage::FromScript;
-        use self::MixedMessage::{FromConstellation, FromDevtools, FromImageCache};
+        use self::MixedMessage::{
+            FromConstellation, FromDevtools, FromImageCache, FromWebGPUServer,
+        };
 
         // Handle pending resize events.
         // Gather them first to avoid a double mut borrow on self.
@@ -1439,9 +1477,7 @@ impl ScriptThread {
         let mut sequential = vec![];
 
         // Notify the background-hang-monitor we are waiting for an event.
-        self.background_hang_monitor
-            .as_ref()
-            .map(|bhm| bhm.notify_wait());
+        self.background_hang_monitor.notify_wait();
 
         // Receive at least one message so we don't spinloop.
         debug!("Waiting for event.");
@@ -1458,6 +1494,8 @@ impl ScriptThread {
             recv(self.devtools_chan.as_ref().map(|_| &self.devtools_port).unwrap_or(&crossbeam_channel::never())) -> msg
                 => FromDevtools(msg.unwrap()),
             recv(self.image_cache_port) -> msg => FromImageCache(msg.unwrap()),
+            recv(self.webgpu_port.borrow().as_ref().unwrap_or(&crossbeam_channel::never())) -> msg
+                => FromWebGPUServer(msg.unwrap()),
         };
         debug!("Got event.");
 
@@ -1476,10 +1514,13 @@ impl ScriptThread {
                         ScriptThreadEventCategory::AttachLayout,
                         Some(pipeline_id),
                         || {
-                            // If this is an about:blank load, it must share the creator's origin.
-                            // This must match the logic in the constellation when creating a new pipeline
-                            let origin = if new_layout_info.load_data.url.as_str() != "about:blank"
-                            {
+                            // If this is an about:blank or about:srcdoc load, it must share the
+                            // creator's origin. This must match the logic in the constellation
+                            // when creating a new pipeline
+                            let not_an_about_blank_and_about_srcdoc_load =
+                                new_layout_info.load_data.url.as_str() != "about:blank" &&
+                                    new_layout_info.load_data.url.as_str() != "about:srcdoc";
+                            let origin = if not_an_about_blank_and_about_srcdoc_load {
                                 MutableOrigin::new(new_layout_info.load_data.url.origin())
                             } else if let Some(parent) =
                                 new_layout_info.parent_info.and_then(|pipeline_id| {
@@ -1553,7 +1594,13 @@ impl ScriptThread {
                 Err(_) => match self.task_queue.try_recv() {
                     Err(_) => match self.devtools_port.try_recv() {
                         Err(_) => match self.image_cache_port.try_recv() {
-                            Err(_) => break,
+                            Err(_) => match &*self.webgpu_port.borrow() {
+                                Some(p) => match p.try_recv() {
+                                    Err(_) => break,
+                                    Ok(ev) => event = FromWebGPUServer(ev),
+                                },
+                                None => break,
+                            },
                             Ok(ev) => event = FromImageCache(ev),
                         },
                         Ok(ev) => event = FromDevtools(ev),
@@ -1575,6 +1622,24 @@ impl ScriptThread {
             let category = self.categorize_msg(&msg);
             let pipeline_id = self.message_to_pipeline(&msg);
 
+            if self.closing.load(Ordering::SeqCst) {
+                // If we've received the closed signal from the BHM, only handle exit messages.
+                match msg {
+                    FromConstellation(ConstellationControlMsg::ExitScriptThread) => {
+                        self.handle_exit_script_thread_msg();
+                        return false;
+                    },
+                    FromConstellation(ConstellationControlMsg::ExitPipeline(
+                        pipeline_id,
+                        discard_browsing_context,
+                    )) => {
+                        self.handle_exit_pipeline_msg(pipeline_id, discard_browsing_context);
+                    },
+                    _ => {},
+                }
+                continue;
+            }
+
             let result = self.profile_event(category, pipeline_id, move || {
                 match msg {
                     FromConstellation(ConstellationControlMsg::ExitScriptThread) => {
@@ -1585,17 +1650,18 @@ impl ScriptThread {
                     FromScript(inner_msg) => self.handle_msg_from_script(inner_msg),
                     FromDevtools(inner_msg) => self.handle_msg_from_devtools(inner_msg),
                     FromImageCache(inner_msg) => self.handle_msg_from_image_cache(inner_msg),
+                    FromWebGPUServer(inner_msg) => self.handle_msg_from_webgpu_server(inner_msg),
                 }
 
                 None
             });
 
-            // https://html.spec.whatwg.org/multipage/#event-loop-processing-model step 6
-            self.perform_a_microtask_checkpoint();
-
             if let Some(retval) = result {
                 return retval;
             }
+
+            // https://html.spec.whatwg.org/multipage/#event-loop-processing-model step 6
+            self.perform_a_microtask_checkpoint();
         }
 
         {
@@ -1640,21 +1706,13 @@ impl ScriptThread {
     }
 
     // Perform step 11.10 from https://html.spec.whatwg.org/multipage/#event-loops.
-    // TODO(mrobinson): This should also update the current animations to conform to
-    // the HTML specification.
     fn update_animations_and_send_events(&self) {
         for (_, document) in self.documents.borrow().iter() {
-            // Only update the time if it isn't being managed by a test.
-            if !pref!(layout.animations.test.enabled) {
-                document.update_animation_timeline();
-            }
+            document.animations().send_pending_events();
         }
 
-        // We remove the events because handling these events might trigger
-        // a reflow which might want to add more events to the queue.
-        let events = self.animation_events.replace(Vec::new());
-        for event in events.into_iter() {
-            self.handle_transition_or_animation_event(&event);
+        for (_, document) in self.documents.borrow().iter() {
+            document.update_animation_timeline();
         }
     }
 
@@ -1674,6 +1732,7 @@ impl ScriptThread {
                 },
                 _ => ScriptThreadEventCategory::ScriptEvent,
             },
+            MixedMessage::FromWebGPUServer(_) => ScriptThreadEventCategory::WebGPUMsg,
         }
     }
 
@@ -1713,10 +1772,10 @@ impl ScriptThread {
                 ScriptHangAnnotation::PerformanceTimelineTask
             },
             ScriptThreadEventCategory::PortMessage => ScriptHangAnnotation::PortMessage,
+            ScriptThreadEventCategory::WebGPUMsg => ScriptHangAnnotation::WebGPUMsg,
         };
         self.background_hang_monitor
-            .as_ref()
-            .map(|bhm| bhm.notify_activity(HangAnnotation::Script(hang_annotation)));
+            .notify_activity(HangAnnotation::Script(hang_annotation));
     }
 
     fn message_to_pipeline(&self, msg: &MixedMessage) -> Option<PipelineId> {
@@ -1758,6 +1817,7 @@ impl ScriptThread {
                 PaintMetric(..) => None,
                 ExitFullScreen(id, ..) => Some(id),
                 MediaSessionAction(..) => None,
+                SetWebGPUPort(..) => None,
             },
             MixedMessage::FromDevtools(_) => None,
             MixedMessage::FromScript(ref inner_msg) => match *inner_msg {
@@ -1767,11 +1827,11 @@ impl ScriptThread {
                 MainThreadScriptMsg::Common(CommonScriptMsg::CollectReports(_)) => None,
                 MainThreadScriptMsg::WorkletLoaded(pipeline_id) => Some(pipeline_id),
                 MainThreadScriptMsg::RegisterPaintWorklet { pipeline_id, .. } => Some(pipeline_id),
-                MainThreadScriptMsg::DispatchJobQueue { .. } => None,
                 MainThreadScriptMsg::Inactive => None,
                 MainThreadScriptMsg::WakeUp => None,
             },
             MixedMessage::FromImageCache((pipeline_id, _)) => Some(pipeline_id),
+            MixedMessage::FromWebGPUServer(..) => None,
         }
     }
 
@@ -1826,6 +1886,7 @@ impl ScriptThread {
                 ScriptThreadEventCategory::PerformanceTimelineTask => {
                     ProfilerCategory::ScriptPerformanceEvent
                 },
+                ScriptThreadEventCategory::WebGPUMsg => ProfilerCategory::ScriptWebGPUMsg,
             };
             profile(profiler_cat, None, self.time_profiler_chan.clone(), f)
         } else {
@@ -1975,6 +2036,14 @@ impl ScriptThread {
             ConstellationControlMsg::MediaSessionAction(pipeline_id, action) => {
                 self.handle_media_session_action(pipeline_id, action)
             },
+            ConstellationControlMsg::SetWebGPUPort(port) => {
+                if self.webgpu_port.borrow().is_some() {
+                    warn!("WebGPU port already exists for this content process");
+                } else {
+                    let p = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(port);
+                    *self.webgpu_port.borrow_mut() = Some(p);
+                }
+            },
             msg @ ConstellationControlMsg::AttachLayout(..) |
             msg @ ConstellationControlMsg::Viewport(..) |
             msg @ ConstellationControlMsg::SetScrollState(..) |
@@ -1983,6 +2052,47 @@ impl ScriptThread {
             msg @ ConstellationControlMsg::ExitScriptThread => {
                 panic!("should have handled {:?} already", msg)
             },
+        }
+    }
+
+    fn handle_msg_from_webgpu_server(&self, msg: WebGPUMsg) {
+        match msg {
+            WebGPUMsg::FreeAdapter(id) => self.gpu_id_hub.lock().kill_adapter_id(id),
+            WebGPUMsg::FreeDevice(id) => self.gpu_id_hub.lock().kill_device_id(id),
+            WebGPUMsg::FreeBuffer(id) => self.gpu_id_hub.lock().kill_buffer_id(id),
+            WebGPUMsg::FreePipelineLayout(id) => self.gpu_id_hub.lock().kill_pipeline_layout_id(id),
+            WebGPUMsg::FreeComputePipeline(id) => {
+                self.gpu_id_hub.lock().kill_compute_pipeline_id(id)
+            },
+            WebGPUMsg::FreeBindGroup(id) => self.gpu_id_hub.lock().kill_bind_group_id(id),
+            WebGPUMsg::FreeBindGroupLayout(id) => {
+                self.gpu_id_hub.lock().kill_bind_group_layout_id(id)
+            },
+            WebGPUMsg::FreeCommandBuffer(id) => self.gpu_id_hub.lock().kill_command_buffer_id(id),
+            WebGPUMsg::FreeSampler(id) => self.gpu_id_hub.lock().kill_sampler_id(id),
+            WebGPUMsg::FreeShaderModule(id) => self.gpu_id_hub.lock().kill_shader_module_id(id),
+            WebGPUMsg::FreeRenderBundle(id) => self.gpu_id_hub.lock().kill_render_bundle_id(id),
+            WebGPUMsg::FreeRenderPipeline(id) => self.gpu_id_hub.lock().kill_render_pipeline_id(id),
+            WebGPUMsg::FreeTexture(id) => self.gpu_id_hub.lock().kill_texture_id(id),
+            WebGPUMsg::FreeTextureView(id) => self.gpu_id_hub.lock().kill_texture_view_id(id),
+            WebGPUMsg::Exit => *self.webgpu_port.borrow_mut() = None,
+            WebGPUMsg::WebGPUOpResult {
+                device,
+                scope_id,
+                pipeline_id,
+                result,
+            } => {
+                let global = self.documents.borrow().find_global(pipeline_id).unwrap();
+                global.handle_wgpu_msg(device, scope_id, result);
+            },
+            WebGPUMsg::CleanDevice {
+                pipeline_id,
+                device,
+            } => {
+                let global = self.documents.borrow().find_global(pipeline_id).unwrap();
+                global.remove_gpu_device(device);
+            },
+            _ => {},
         }
     }
 
@@ -2001,9 +2111,6 @@ impl ScriptThread {
                 properties,
                 painter,
             } => self.handle_register_paint_worklet(pipeline_id, name, properties, painter),
-            MainThreadScriptMsg::DispatchJobQueue { scope_url } => {
-                self.job_queue_map.run_job(scope_url, self)
-            },
             MainThreadScriptMsg::Inactive => {},
             MainThreadScriptMsg::WakeUp => {},
         }
@@ -2396,12 +2503,12 @@ impl ScriptThread {
         });
 
         // Pick a layout thread, any layout thread
-        let current_layout_chan = self
+        let current_layout_chan: Option<Sender<Msg>> = self
             .documents
             .borrow()
             .iter()
             .next()
-            .map(|(_, document)| document.window().layout_chan().clone())
+            .and_then(|(_, document)| document.window().layout_chan().cloned())
             .or_else(|| {
                 self.incomplete_loads
                     .borrow()
@@ -2427,11 +2534,12 @@ impl ScriptThread {
             load_data.url.clone(),
             origin,
             layout_is_busy.clone(),
+            load_data.inherited_secure_context.clone(),
         );
         if load_data.url.as_str() == "about:blank" {
             self.start_page_load_about_blank(new_load, load_data.js_eval_result);
         } else if load_data.url.as_str() == "about:srcdoc" {
-            self.page_load_about_srcdoc(new_load, load_data.srcdoc);
+            self.page_load_about_srcdoc(new_load, load_data);
         } else {
             self.pre_page_load(new_load, load_data);
         }
@@ -2523,9 +2631,7 @@ impl ScriptThread {
         let frame_element = doc.find_iframe(browsing_context_id);
 
         if let Some(ref frame_element) = frame_element {
-            doc.begin_focus_transaction();
-            doc.request_focus(frame_element.upcast());
-            doc.commit_focus_transaction(FocusType::Parent);
+            doc.request_focus(Some(frame_element.upcast()), FocusType::Parent);
         }
     }
 
@@ -2713,57 +2819,6 @@ impl ScriptThread {
         }
     }
 
-    pub fn handle_get_registration(
-        &self,
-        scope_url: &ServoUrl,
-    ) -> Option<DomRoot<ServiceWorkerRegistration>> {
-        let maybe_registration_ref = self.registration_map.borrow();
-        maybe_registration_ref
-            .get(scope_url)
-            .map(|x| DomRoot::from_ref(&**x))
-    }
-
-    pub fn handle_serviceworker_registration(
-        &self,
-        scope: &ServoUrl,
-        registration: &ServiceWorkerRegistration,
-        pipeline_id: PipelineId,
-    ) {
-        {
-            let ref mut reg_ref = *self.registration_map.borrow_mut();
-            // according to spec we should replace if an older registration exists for
-            // same scope otherwise just insert the new one
-            let _ = reg_ref.remove(scope);
-            reg_ref.insert(scope.clone(), Dom::from_ref(registration));
-        }
-
-        // send ScopeThings to sw-manager
-        let ref maybe_registration_ref = *self.registration_map.borrow();
-        let maybe_registration = match maybe_registration_ref.get(scope) {
-            Some(r) => r,
-            None => return,
-        };
-        let window = match self.documents.borrow().find_window(pipeline_id) {
-            Some(window) => window,
-            None => return warn!("Registration failed for {}", scope),
-        };
-
-        let script_url = maybe_registration.get_installed().get_script_url();
-        let scope_things =
-            ServiceWorkerRegistration::create_scope_things(window.upcast(), script_url);
-        let _ = self.script_sender.send((
-            pipeline_id,
-            ScriptMsg::RegisterServiceWorker(scope_things, scope.clone()),
-        ));
-    }
-
-    pub fn schedule_job_queue(&self, scope_url: ServoUrl) {
-        let _ = self
-            .chan
-            .0
-            .send(MainThreadScriptMsg::DispatchJobQueue { scope_url });
-    }
-
     pub fn dom_manipulation_task_source(
         &self,
         pipeline_id: PipelineId,
@@ -2861,7 +2916,10 @@ impl ScriptThread {
             let load = self.incomplete_loads.borrow_mut().remove(idx);
             load.layout_chan.clone()
         } else if let Some(ref document) = document {
-            document.window().layout_chan().clone()
+            match document.window().layout_chan() {
+                Some(chan) => chan.clone(),
+                None => return warn!("Layout channel unavailable"),
+            }
         } else {
             return warn!("Exiting nonexistant pipeline {}.", id);
         };
@@ -2879,11 +2937,11 @@ impl ScriptThread {
             .send((id, ScriptMsg::PipelineExited))
             .ok();
 
-        // Remove any rooted nodes for active animations and transitions.
-        self.animating_nodes.borrow_mut().remove(&id);
-
         // Now that layout is shut down, it's OK to remove the document.
         if let Some(document) = document {
+            // Clear any active animations and unroot all of the associated DOM objects.
+            document.animations().clear();
+
             // We don't want to dispatch `mouseout` event pointing to non-existing element
             if let Some(target) = self.topmost_mouse_over_target.get() {
                 if target.upcast::<Node>().owner_doc() == document {
@@ -2927,9 +2985,7 @@ impl ScriptThread {
             self.handle_exit_pipeline_msg(pipeline_id, DiscardBrowsingContext::Yes);
         }
 
-        self.background_hang_monitor
-            .as_ref()
-            .map(|bhm| bhm.unregister());
+        self.background_hang_monitor.unregister();
 
         // If we're in multiprocess mode, shut-down the IPC router for this process.
         if opts::multiprocess() {
@@ -2959,94 +3015,8 @@ impl ScriptThread {
             document.run_the_animation_frame_callbacks();
         }
         if tick_type.contains(AnimationTickType::CSS_ANIMATIONS_AND_TRANSITIONS) {
-            match self.animating_nodes.borrow().get(&id) {
-                Some(nodes) => {
-                    for node in nodes.iter() {
-                        node.dirty(NodeDamage::NodeStyleDamaged);
-                    }
-                },
-                None => return,
-            }
-
+            document.animations().mark_animating_nodes_as_dirty();
             document.window().add_pending_reflow();
-        }
-    }
-
-    /// Handles firing of transition-related events.
-    ///
-    /// TODO(mrobinson): Add support for more events.
-    fn handle_transition_or_animation_event(&self, event: &TransitionOrAnimationEvent) {
-        let js_runtime = self.js_runtime.rt();
-        let node = unsafe { from_untrusted_node_address(js_runtime, event.node) };
-
-        // We limit the scope of the borrow here, so that we don't maintain this borrow
-        // and then incidentally trigger another layout. That might result in a double
-        // mutable borrow of `animating_nodes`.
-        {
-            let mut animating_nodes = self.animating_nodes.borrow_mut();
-            let nodes = match animating_nodes.get_mut(&event.pipeline_id) {
-                Some(nodes) => nodes,
-                None => {
-                    return warn!(
-                        "Ignoring transition event for pipeline without animating nodes."
-                    );
-                },
-            };
-
-            let node_index = nodes
-                .iter()
-                .position(|n| &**n as *const _ == &*node as *const _);
-            let node_index = match node_index {
-                Some(node_index) => node_index,
-                None => {
-                    // If no index is found, we can't know whether this node is safe to use.
-                    // It's better not to fire a DOM event than crash.
-                    warn!("Ignoring transition event for unknown node.");
-                    return;
-                },
-            };
-
-            if event.event_type.finalizes_transition_or_animation() {
-                nodes.remove(node_index);
-            }
-        }
-
-        let event_atom = match event.event_type {
-            TransitionOrAnimationEventType::AnimationEnd => atom!("animationend"),
-            TransitionOrAnimationEventType::TransitionCancel => atom!("transitioncancel"),
-            TransitionOrAnimationEventType::TransitionEnd => atom!("transitionend"),
-            TransitionOrAnimationEventType::TransitionRun => atom!("transitionrun"),
-        };
-        let parent = EventInit {
-            bubbles: true,
-            cancelable: false,
-        };
-
-        // TODO: Handle pseudo-elements properly
-        let property_or_animation_name = DOMString::from(event.property_or_animation_name.clone());
-        let elapsed_time = Finite::new(event.elapsed_time as f32).unwrap();
-        let window = window_from_node(&*node);
-
-        if event.event_type.is_transition_event() {
-            let event_init = TransitionEventInit {
-                parent,
-                propertyName: property_or_animation_name,
-                elapsedTime: elapsed_time,
-                pseudoElement: DOMString::new(),
-            };
-            TransitionEvent::new(&window, event_atom, &event_init)
-                .upcast::<Event>()
-                .fire(node.upcast());
-        } else {
-            let event_init = AnimationEventInit {
-                parent,
-                animationName: property_or_animation_name,
-                elapsedTime: elapsed_time,
-                pseudoElement: DOMString::new(),
-            };
-            AnimationEvent::new(&window, event_atom, &event_init)
-                .upcast::<Event>()
-                .fire(node.upcast());
         }
     }
 
@@ -3154,7 +3124,7 @@ impl ScriptThread {
             return Some(DomRoot::from_ref(window_proxy));
         }
 
-        let parent = parent_pipeline_id.and_then(|parent_id| {
+        let parent_browsing_context = parent_pipeline_id.and_then(|parent_id| {
             self.remote_window_proxy(
                 global_to_clone,
                 top_level_browsing_context_id,
@@ -3162,12 +3132,21 @@ impl ScriptThread {
                 opener,
             )
         });
+
+        let opener_browsing_context = opener.and_then(|id| ScriptThread::find_window_proxy(id));
+
+        let creator = CreatorBrowsingContextInfo::from(
+            parent_browsing_context.as_deref(),
+            opener_browsing_context.as_deref(),
+        );
+
         let window_proxy = WindowProxy::new_dissimilar_origin(
             global_to_clone,
             browsing_context_id,
             top_level_browsing_context_id,
-            parent.as_deref(),
+            parent_browsing_context.as_deref(),
             opener,
+            creator,
         );
         self.window_proxies
             .borrow_mut()
@@ -3199,7 +3178,7 @@ impl ScriptThread {
                 .borrow()
                 .find_iframe(parent_id, browsing_context_id)
         });
-        let parent = match (parent_info, iframe.as_ref()) {
+        let parent_browsing_context = match (parent_info, iframe.as_ref()) {
             (_, Some(iframe)) => Some(window_from_node(&**iframe).window_proxy()),
             (Some(parent_id), _) => self.remote_window_proxy(
                 window.upcast(),
@@ -3209,13 +3188,22 @@ impl ScriptThread {
             ),
             _ => None,
         };
+
+        let opener_browsing_context = opener.and_then(|id| ScriptThread::find_window_proxy(id));
+
+        let creator = CreatorBrowsingContextInfo::from(
+            parent_browsing_context.as_deref(),
+            opener_browsing_context.as_deref(),
+        );
+
         let window_proxy = WindowProxy::new(
             &window,
             browsing_context_id,
             top_level_browsing_context_id,
             iframe.as_deref().map(Castable::upcast),
-            parent.as_deref(),
+            parent_browsing_context.as_deref(),
             opener,
+            creator,
         );
         self.window_proxies
             .borrow_mut()
@@ -3295,6 +3283,7 @@ impl ScriptThread {
             incomplete.parent_info,
             incomplete.window_size,
             origin.clone(),
+            final_url.clone(),
             incomplete.navigation_start,
             incomplete.navigation_start_precise,
             self.webgl_chan.as_ref().map(|chan| chan.channel()),
@@ -3306,12 +3295,15 @@ impl ScriptThread {
             self.relayout_event,
             self.prepare_for_screenshot,
             self.unminify_js,
+            self.local_script_source.clone(),
             self.userscripts_path.clone(),
             self.headless,
             self.replace_surrogates,
             self.user_agent.clone(),
             self.player_context.clone(),
             self.event_loop_waker.as_ref().map(|w| (*w).clone_box()),
+            self.gpu_id_hub.clone(),
+            incomplete.inherited_secure_context,
         );
 
         // Initialize the browsing context for the window.
@@ -3423,15 +3415,13 @@ impl ScriptThread {
             (incomplete.browsing_context_id, incomplete.pipeline_id, None),
         );
 
-        let parse_input = DOMString::new();
-
         document.set_https_state(metadata.https_state);
         document.set_navigation_start(incomplete.navigation_start_precise);
 
         if is_html_document == IsHTMLDocument::NonHTMLDocument {
-            ServoParser::parse_xml_document(&document, parse_input, final_url);
+            ServoParser::parse_xml_document(&document, None, final_url);
         } else {
-            ServoParser::parse_html_document(&document, parse_input, final_url);
+            ServoParser::parse_html_document(&document, None, final_url);
         }
 
         if incomplete.activity == DocumentActivity::FullyActive {
@@ -3535,13 +3525,14 @@ impl ScriptThread {
                 // Get the previous target temporarily
                 let prev_mouse_over_target = self.topmost_mouse_over_target.get();
 
-                document.handle_mouse_move_event(
-                    self.js_runtime.rt(),
-                    point,
-                    &self.topmost_mouse_over_target,
-                    node_address,
-                    pressed_mouse_buttons,
-                );
+                unsafe {
+                    document.handle_mouse_move_event(
+                        point,
+                        &self.topmost_mouse_over_target,
+                        node_address,
+                        pressed_mouse_buttons,
+                    )
+                }
 
                 // Short-circuit if nothing changed
                 if self.topmost_mouse_over_target.get() == prev_mouse_over_target {
@@ -3626,6 +3617,14 @@ impl ScriptThread {
                 document.dispatch_key_event(key_event);
             },
 
+            IMEDismissedEvent => {
+                let document = match self.documents.borrow().find_document(pipeline_id) {
+                    Some(document) => document,
+                    None => return warn!("Message sent to closed pipeline {}.", pipeline_id),
+                };
+                document.ime_dismissed();
+            },
+
             CompositionEvent(composition_event) => {
                 let document = match self.documents.borrow().find_document(pipeline_id) {
                     Some(document) => document,
@@ -3652,15 +3651,16 @@ impl ScriptThread {
             Some(document) => document,
             None => return warn!("Message sent to closed pipeline {}.", pipeline_id),
         };
-        document.handle_mouse_event(
-            self.js_runtime.rt(),
-            button,
-            point,
-            mouse_event_type,
-            node_address,
-            point_in_node,
-            pressed_mouse_buttons,
-        );
+        unsafe {
+            document.handle_mouse_event(
+                button,
+                point,
+                mouse_event_type,
+                node_address,
+                point_in_node,
+                pressed_mouse_buttons,
+            )
+        }
     }
 
     fn handle_touch_event(
@@ -3678,13 +3678,7 @@ impl ScriptThread {
                 return TouchEventResult::Processed(true);
             },
         };
-        document.handle_touch_event(
-            self.js_runtime.rt(),
-            event_type,
-            identifier,
-            point,
-            node_address,
-        )
+        unsafe { document.handle_touch_event(event_type, identifier, point, node_address) }
     }
 
     fn handle_wheel_event(
@@ -3698,7 +3692,7 @@ impl ScriptThread {
             Some(document) => document,
             None => return warn!("Message sent to closed pipeline {}.", pipeline_id),
         };
-        document.handle_wheel_event(self.js_runtime.rt(), wheel_delta, point, node_address);
+        unsafe { document.handle_wheel_event(wheel_delta, point, node_address) };
     }
 
     /// Handle a "navigate an iframe" message from the constellation.
@@ -3737,7 +3731,12 @@ impl ScriptThread {
         // Script source is ready to be evaluated (11.)
         let _ac = enter_realm(global_scope);
         rooted!(in(*global_scope.get_cx()) let mut jsval = UndefinedValue());
-        global_scope.evaluate_js_on_global_with_result(&script_source, jsval.handle_mut());
+        global_scope.evaluate_js_on_global_with_result(
+            &script_source,
+            jsval.handle_mut(),
+            ScriptFetchOptions::default_classic_script(&global_scope),
+            global_scope.api_base_url(),
+        );
 
         load_data.js_eval_result = if jsval.get().is_string() {
             unsafe {
@@ -3807,13 +3806,12 @@ impl ScriptThread {
     /// argument until a notification is received that the fetch is complete.
     fn pre_page_load(&self, mut incomplete: InProgressLoad, load_data: LoadData) {
         let id = incomplete.pipeline_id.clone();
-        let req_init = RequestBuilder::new(load_data.url.clone())
+        let req_init = RequestBuilder::new(load_data.url.clone(), load_data.referrer)
             .method(load_data.method)
             .destination(Destination::Document)
             .credentials_mode(CredentialsMode::Include)
             .use_url_credentials(true)
             .pipeline_id(Some(id))
-            .referrer(load_data.referrer)
             .referrer_policy(load_data.referrer_policy)
             .headers(load_data.headers)
             .body(load_data.data)
@@ -3822,6 +3820,7 @@ impl ScriptThread {
 
         let context = ParserContext::new(id, load_data.url);
         self.incomplete_parser_contexts
+            .0
             .borrow_mut()
             .push((id, context));
 
@@ -3848,7 +3847,7 @@ impl ScriptThread {
             },
         };
 
-        let mut incomplete_parser_contexts = self.incomplete_parser_contexts.borrow_mut();
+        let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
         let parser = incomplete_parser_contexts
             .iter_mut()
             .find(|&&mut (pipeline_id, _)| pipeline_id == id);
@@ -3858,7 +3857,7 @@ impl ScriptThread {
     }
 
     fn handle_fetch_chunk(&self, id: PipelineId, chunk: Vec<u8>) {
-        let mut incomplete_parser_contexts = self.incomplete_parser_contexts.borrow_mut();
+        let mut incomplete_parser_contexts = self.incomplete_parser_contexts.0.borrow_mut();
         let parser = incomplete_parser_contexts
             .iter_mut()
             .find(|&&mut (pipeline_id, _)| pipeline_id == id);
@@ -3870,12 +3869,13 @@ impl ScriptThread {
     fn handle_fetch_eof(&self, id: PipelineId, eof: Result<ResourceFetchTiming, NetworkError>) {
         let idx = self
             .incomplete_parser_contexts
+            .0
             .borrow()
             .iter()
             .position(|&(pipeline_id, _)| pipeline_id == id);
 
         if let Some(idx) = idx {
-            let (_, mut ctxt) = self.incomplete_parser_contexts.borrow_mut().remove(idx);
+            let (_, mut ctxt) = self.incomplete_parser_contexts.0.borrow_mut().remove(idx);
             ctxt.process_response_eof(eof);
         }
     }
@@ -3914,7 +3914,7 @@ impl ScriptThread {
     }
 
     /// Synchronously parse a srcdoc document from a giving HTML string.
-    fn page_load_about_srcdoc(&self, incomplete: InProgressLoad, src_doc: String) {
+    fn page_load_about_srcdoc(&self, incomplete: InProgressLoad, load_data: LoadData) {
         let id = incomplete.pipeline_id;
 
         self.incomplete_loads.borrow_mut().push(incomplete);
@@ -3924,8 +3924,9 @@ impl ScriptThread {
 
         let mut meta = Metadata::default(url);
         meta.set_content_type(Some(&mime::TEXT_HTML));
+        meta.set_referrer_policy(load_data.referrer_policy);
 
-        let chunk = src_doc.into_bytes();
+        let chunk = load_data.srcdoc.into_bytes();
 
         context.process_response(Ok(FetchMetadata::Unfiltered(meta)));
         context.process_response_chunk(chunk);
@@ -4004,18 +4005,21 @@ impl ScriptThread {
     }
 
     fn perform_a_microtask_checkpoint(&self) {
-        let globals = self
-            .documents
-            .borrow()
-            .iter()
-            .map(|(_id, document)| document.global())
-            .collect();
+        // Only perform the checkpoint if we're not shutting down.
+        if self.can_continue_running_inner() {
+            let globals = self
+                .documents
+                .borrow()
+                .iter()
+                .map(|(_id, document)| document.global())
+                .collect();
 
-        self.microtask_queue.checkpoint(
-            self.get_cx(),
-            |id| self.documents.borrow().find_global(id),
-            globals,
-        )
+            self.microtask_queue.checkpoint(
+                self.get_cx(),
+                |id| self.documents.borrow().find_global(id),
+                globals,
+            )
+        }
     }
 }
 

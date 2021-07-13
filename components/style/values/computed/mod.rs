@@ -21,15 +21,19 @@ use crate::media_queries::Device;
 use crate::properties;
 use crate::properties::{ComputedValues, LonghandId, StyleBuilder};
 use crate::rule_cache::RuleCacheConditions;
-use crate::{ArcSlice, Atom};
-use euclid::default::Size2D;
+use crate::{ArcSlice, Atom, One};
+use euclid::{default, Point2D, Rect, Size2D};
 use servo_arc::Arc;
 use std::cell::RefCell;
 use std::cmp;
 use std::f32;
+use std::ops::{Add, Sub};
 
 #[cfg(feature = "gecko")]
-pub use self::align::{AlignContent, AlignItems, JustifyContent, JustifyItems, SelfAlignment};
+pub use self::align::{
+    AlignContent, AlignItems, AlignTracks, JustifyContent, JustifyItems, JustifyTracks,
+    SelfAlignment,
+};
 #[cfg(feature = "gecko")]
 pub use self::align::{AlignSelf, JustifySelf};
 pub use self::angle::Angle;
@@ -55,7 +59,7 @@ pub use self::font::{FontFeatureSettings, FontVariantLigatures, FontVariantNumer
 pub use self::font::{FontSize, FontSizeAdjust, FontStretch, FontSynthesis};
 pub use self::font::{FontVariantAlternates, FontWeight};
 pub use self::font::{FontVariantEastAsian, FontVariationSettings};
-pub use self::font::{MozScriptLevel, MozScriptMinSize, MozScriptSizeMultiplier, XLang, XTextZoom};
+pub use self::font::{MathDepth, MozScriptMinSize, MozScriptSizeMultiplier, XLang, XTextZoom};
 pub use self::image::{Gradient, Image, LineDirection, MozImageRect};
 pub use self::length::{CSSPixelLength, ExtremumLength, NonNegativeLength};
 pub use self::length::{Length, LengthOrNumber, LengthPercentage, NonNegativeLengthOrNumber};
@@ -67,8 +71,13 @@ pub use self::list::MozListReversed;
 pub use self::list::Quotes;
 pub use self::motion::{OffsetPath, OffsetRotate};
 pub use self::outline::OutlineStyle;
+pub use self::page::{Orientation, PageSize, PaperSize};
 pub use self::percentage::{NonNegativePercentage, Percentage};
-pub use self::position::{GridAutoFlow, GridTemplateAreas, Position, PositionOrAuto, ZIndex};
+pub use self::position::AspectRatio;
+pub use self::position::{
+    GridAutoFlow, GridTemplateAreas, MasonryAutoFlow, Position, PositionOrAuto, ZIndex,
+};
+pub use self::ratio::Ratio;
 pub use self::rect::NonNegativeLengthOrNumberRect;
 pub use self::resolution::Resolution;
 pub use self::svg::MozContextProperties;
@@ -111,11 +120,14 @@ pub mod length_percentage;
 pub mod list;
 pub mod motion;
 pub mod outline;
+pub mod page;
 pub mod percentage;
 pub mod position;
+pub mod ratio;
 pub mod rect;
 pub mod resolution;
 pub mod svg;
+pub mod table;
 pub mod text;
 pub mod time;
 pub mod transform;
@@ -202,7 +214,7 @@ impl<'a> Context<'a> {
     }
 
     /// The current viewport size, used to resolve viewport units.
-    pub fn viewport_size_for_viewport_unit_resolution(&self) -> Size2D<Au> {
+    pub fn viewport_size_for_viewport_unit_resolution(&self) -> default::Size2D<Au> {
         self.builder
             .device
             .au_viewport_size_for_viewport_unit_resolution()
@@ -223,9 +235,9 @@ impl<'a> Context<'a> {
     pub fn maybe_zoom_text(&self, size: CSSPixelLength) -> CSSPixelLength {
         // We disable zoom for <svg:text> by unsetting the
         // -x-text-zoom property, which leads to a false value
-        // in mAllowZoom
-        if self.style().get_font().gecko.mAllowZoom {
-            self.device().zoom_text(Au::from(size)).into()
+        // in mAllowZoomAndMinSize
+        if self.style().get_font().gecko.mAllowZoomAndMinSize {
+            self.device().zoom_text(size)
         } else {
             size
         }
@@ -347,11 +359,11 @@ where
     }
 }
 
-impl<T> ToComputedValue for Size2D<T>
+impl<T> ToComputedValue for default::Size2D<T>
 where
     T: ToComputedValue,
 {
-    type ComputedValue = Size2D<<T as ToComputedValue>::ComputedValue>;
+    type ComputedValue = default::Size2D<<T as ToComputedValue>::ComputedValue>;
 
     #[inline]
     fn to_computed_value(&self, context: &Context) -> Self::ComputedValue {
@@ -498,10 +510,11 @@ trivial_to_computed_value!(u16);
 trivial_to_computed_value!(u32);
 trivial_to_computed_value!(usize);
 trivial_to_computed_value!(Atom);
+trivial_to_computed_value!(crate::values::AtomIdent);
 #[cfg(feature = "servo")]
-trivial_to_computed_value!(html5ever::Namespace);
+trivial_to_computed_value!(crate::Namespace);
 #[cfg(feature = "servo")]
-trivial_to_computed_value!(html5ever::Prefix);
+trivial_to_computed_value!(crate::Prefix);
 trivial_to_computed_value!(String);
 trivial_to_computed_value!(Box<str>);
 trivial_to_computed_value!(crate::OwnedStr);
@@ -597,6 +610,18 @@ impl From<NonNegativeNumber> for CSSFloat {
     #[inline]
     fn from(number: NonNegativeNumber) -> CSSFloat {
         number.0
+    }
+}
+
+impl One for NonNegativeNumber {
+    #[inline]
+    fn one() -> Self {
+        NonNegative(1.0)
+    }
+
+    #[inline]
+    fn is_one(&self) -> bool {
+        self.0 == 1.0
     }
 }
 
@@ -796,3 +821,29 @@ pub type GridLine = GenericGridLine<Integer>;
 
 /// `<grid-template-rows> | <grid-template-columns>`
 pub type GridTemplateComponent = GenericGridTemplateComponent<LengthPercentage, Integer>;
+
+impl ClipRect {
+    /// Given a border box, resolves the clip rect against the border box
+    /// in the same space the border box is in
+    pub fn for_border_rect<T: Copy + From<Length> + Add<Output = T> + Sub<Output = T>, U>(
+        &self,
+        border_box: Rect<T, U>,
+    ) -> Rect<T, U> {
+        fn extract_clip_component<T: From<Length>>(p: &LengthOrAuto, or: T) -> T {
+            match *p {
+                LengthOrAuto::Auto => or,
+                LengthOrAuto::LengthPercentage(ref length) => T::from(*length),
+            }
+        }
+
+        let clip_origin = Point2D::new(
+            From::from(self.left.auto_is(|| Length::new(0.))),
+            From::from(self.top.auto_is(|| Length::new(0.))),
+        );
+        let right = extract_clip_component(&self.right, border_box.size.width);
+        let bottom = extract_clip_component(&self.bottom, border_box.size.height);
+        let clip_size = Size2D::new(right - clip_origin.x, bottom - clip_origin.y);
+
+        Rect::new(clip_origin, clip_size).translate(border_box.origin.to_vector())
+    }
+}

@@ -129,9 +129,10 @@ use style::selector_parser::{
     NonTSPseudoClass, PseudoElement, RestyleDamage, SelectorImpl, SelectorParser,
 };
 use style::shared_lock::{Locked, SharedRwLock};
+use style::stylesheets::CssRuleType;
 use style::thread_state;
 use style::values::generics::NonNegative;
-use style::values::{computed, specified, CSSFloat};
+use style::values::{computed, specified, AtomIdent, AtomString, CSSFloat};
 use style::CaseSensitivityExt;
 use xml5ever::serialize as xmlSerialize;
 use xml5ever::serialize::SerializeOpts as XmlSerializeOpts;
@@ -309,6 +310,7 @@ impl Element {
         restyle.hint.insert(RestyleHint::RESTYLE_SELF);
 
         if damage == NodeDamage::OtherNodeDamage {
+            doc.note_node_with_dirty_descendants(self.upcast());
             restyle.damage = RestyleDamage::rebuild_and_reflow();
         }
     }
@@ -515,6 +517,7 @@ impl Element {
 
     pub fn detach_shadow(&self) {
         if let Some(ref shadow_root) = self.shadow_root() {
+            self.upcast::<Node>().note_dirty_descendants();
             shadow_root.detach();
             self.ensure_rare_data().shadow_root = None;
         } else {
@@ -566,7 +569,7 @@ pub fn get_attr_for_layout<'dom>(
 
 pub trait LayoutElementHelpers<'dom> {
     fn attrs(self) -> &'dom [LayoutDom<'dom, Attr>];
-    fn has_class_for_layout(self, name: &Atom, case_sensitivity: CaseSensitivity) -> bool;
+    fn has_class_for_layout(self, name: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool;
     fn get_classes_for_layout(self) -> Option<&'dom [Atom]>;
 
     fn synthesize_presentational_hints_for_legacy_attributes<V>(self, hints: &mut V)
@@ -614,7 +617,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
     }
 
     #[inline]
-    fn has_class_for_layout(self, name: &Atom, case_sensitivity: CaseSensitivity) -> bool {
+    fn has_class_for_layout(self, name: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool {
         get_attr_for_layout(self, &ns!(), &local_name!("class")).map_or(false, |attr| {
             attr.as_tokens()
                 .unwrap()
@@ -1298,12 +1301,12 @@ impl Element {
         if self.is_actually_disabled() {
             return false;
         }
-        // TODO: Check whether the element is being rendered (i.e. not hidden).
         let node = self.upcast::<Node>();
         if node.get_flag(NodeFlags::SEQUENTIALLY_FOCUSABLE) {
             return true;
         }
-        // https://html.spec.whatwg.org/multipage/#specially-focusable
+
+        // <a>, <input>, <select>, and <textrea> are inherently focusable.
         match node.type_id() {
             NodeTypeId::Element(ElementTypeId::HTMLElement(
                 HTMLElementTypeId::HTMLAnchorElement,
@@ -1830,6 +1833,67 @@ impl Element {
     pub fn get_name(&self) -> Option<Atom> {
         self.rare_data().as_ref()?.name_attribute.clone()
     }
+
+    fn is_sequentially_focusable(&self) -> bool {
+        let element = self.upcast::<Element>();
+        let node = self.upcast::<Node>();
+        if !node.is_connected() {
+            return false;
+        }
+
+        if element.has_attribute(&local_name!("hidden")) {
+            return false;
+        }
+
+        if self.disabled_state() {
+            return false;
+        }
+
+        if element.has_attribute(&local_name!("tabindex")) {
+            return true;
+        }
+
+        match node.type_id() {
+            // <button>, <select>, <iframe>, and <textarea> are implicitly focusable.
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLButtonElement,
+            )) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLSelectElement,
+            )) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLIFrameElement,
+            )) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLTextAreaElement,
+            )) => true,
+
+            // Links that generate actual links are focusable.
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLLinkElement)) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLAnchorElement,
+            )) => element.has_attribute(&local_name!("href")),
+
+            //TODO focusable if editing host
+            //TODO focusable if "sorting interface th elements"
+            _ => {
+                // Draggable elements are focusable.
+                element.get_string_attribute(&local_name!("draggable")) == "true"
+            },
+        }
+    }
+
+    pub(crate) fn update_sequentially_focusable_status(&self) {
+        let node = self.upcast::<Node>();
+        let is_sequentially_focusable = self.is_sequentially_focusable();
+        node.set_flag(NodeFlags::SEQUENTIALLY_FOCUSABLE, is_sequentially_focusable);
+
+        // https://html.spec.whatwg.org/multipage/#focus-fixup-rule
+        if !is_sequentially_focusable {
+            let document = document_from_node(self);
+            document.perform_focus_fixup_rule(self);
+        }
+    }
 }
 
 impl ElementMethods for Element {
@@ -1890,7 +1954,7 @@ impl ElementMethods for Element {
     // https://dom.spec.whatwg.org/#dom-element-classlist
     fn ClassList(&self) -> DomRoot<DOMTokenList> {
         self.class_list
-            .or_init(|| DOMTokenList::new(self, &local_name!("class")))
+            .or_init(|| DOMTokenList::new(self, &local_name!("class"), None))
     }
 
     // https://dom.spec.whatwg.org/#dom-element-attributes
@@ -2574,6 +2638,11 @@ impl ElementMethods for Element {
         self.upcast::<Node>().append(nodes)
     }
 
+    // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
+    fn ReplaceChildren(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
+        self.upcast::<Node>().replace_children(nodes)
+    }
+
     // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
     fn QuerySelector(&self, selectors: DOMString) -> Fallible<Option<DomRoot<Element>>> {
         let root = self.upcast::<Node>();
@@ -2749,6 +2818,9 @@ impl VirtualMethods for Element {
         let node = self.upcast::<Node>();
         let doc = node.owner_doc();
         match attr.local_name() {
+            &local_name!("tabindex") | &local_name!("draggable") | &local_name!("hidden") => {
+                self.update_sequentially_focusable_status()
+            },
             &local_name!("style") => {
                 // Modifying the `style` attribute might change style.
                 *self.style_attribute.borrow_mut() = match mutation {
@@ -2780,6 +2852,7 @@ impl VirtualMethods for Element {
                                 &doc.base_url(),
                                 win.css_error_reporter(),
                                 doc.quirks_mode(),
+                                CssRuleType::Style,
                             )))
                         };
 
@@ -2915,16 +2988,18 @@ impl VirtualMethods for Element {
             return;
         }
 
-        if let Some(ref value) = *self.id_attribute.borrow() {
+        self.update_sequentially_focusable_status();
+
+        if let Some(ref id) = *self.id_attribute.borrow() {
             if let Some(shadow_root) = self.upcast::<Node>().containing_shadow_root() {
-                shadow_root.register_element_id(self, value.clone());
+                shadow_root.register_element_id(self, id.clone());
             } else {
-                doc.register_element_id(self, value.clone());
+                doc.register_element_id(self, id.clone());
             }
         }
-        if let Some(ref value) = self.name_attribute() {
+        if let Some(ref name) = self.name_attribute() {
             if self.upcast::<Node>().containing_shadow_root().is_none() {
-                doc.register_element_name(self, value.clone());
+                doc.register_element_name(self, name.clone());
             }
         }
 
@@ -2942,6 +3017,8 @@ impl VirtualMethods for Element {
         if !context.tree_connected {
             return;
         }
+
+        self.update_sequentially_focusable_status();
 
         let doc = document_from_node(self);
 
@@ -3060,16 +3137,16 @@ impl<'a> SelectorsElement for DomRoot<Element> {
 
     fn attr_matches(
         &self,
-        ns: &NamespaceConstraint<&Namespace>,
-        local_name: &LocalName,
-        operation: &AttrSelectorOperation<&String>,
+        ns: &NamespaceConstraint<&style::Namespace>,
+        local_name: &style::LocalName,
+        operation: &AttrSelectorOperation<&AtomString>,
     ) -> bool {
         match *ns {
             NamespaceConstraint::Specific(ref ns) => self
                 .get_attribute(ns, local_name)
                 .map_or(false, |attr| attr.value().eval_selector(operation)),
             NamespaceConstraint::Any => self.attrs.borrow().iter().any(|attr| {
-                attr.local_name() == local_name && attr.value().eval_selector(operation)
+                *attr.local_name() == **local_name && attr.value().eval_selector(operation)
             }),
         }
     }
@@ -3165,23 +3242,23 @@ impl<'a> SelectorsElement for DomRoot<Element> {
         }
     }
 
-    fn has_id(&self, id: &Atom, case_sensitivity: CaseSensitivity) -> bool {
+    fn has_id(&self, id: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool {
         self.id_attribute
             .borrow()
             .as_ref()
-            .map_or(false, |atom| case_sensitivity.eq_atom(id, atom))
+            .map_or(false, |atom| case_sensitivity.eq_atom(&*id, atom))
     }
 
-    fn is_part(&self, _name: &Atom) -> bool {
+    fn is_part(&self, _name: &AtomIdent) -> bool {
         false
     }
 
-    fn imported_part(&self, _: &Atom) -> Option<Atom> {
+    fn imported_part(&self, _: &AtomIdent) -> Option<AtomIdent> {
         None
     }
 
-    fn has_class(&self, name: &Atom, case_sensitivity: CaseSensitivity) -> bool {
-        Element::has_class(&**self, name, case_sensitivity)
+    fn has_class(&self, name: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool {
+        Element::has_class(&**self, &name, case_sensitivity)
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
@@ -3232,6 +3309,10 @@ impl Element {
                 HTMLElementTypeId::HTMLLabelElement,
             )) => {
                 let element = self.downcast::<HTMLLabelElement>().unwrap();
+                Some(element as &dyn Activatable)
+            },
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLElement)) => {
+                let element = self.downcast::<HTMLElement>().unwrap();
                 Some(element as &dyn Activatable)
             },
             _ => None,
@@ -3692,6 +3773,27 @@ pub fn set_cross_origin_attribute(element: &Element, value: Option<DOMString>) {
             element.remove_attribute(&ns!(), &local_name!("crossorigin"));
         },
     }
+}
+
+pub fn reflect_referrer_policy_attribute(element: &Element) -> DOMString {
+    let attr =
+        element.get_attribute_by_name(DOMString::from_string(String::from("referrerpolicy")));
+
+    if let Some(mut val) = attr.map(|v| v.Value()) {
+        val.make_ascii_lowercase();
+        if val == "no-referrer" ||
+            val == "no-referrer-when-downgrade" ||
+            val == "same-origin" ||
+            val == "origin" ||
+            val == "strict-origin" ||
+            val == "origin-when-cross-origin" ||
+            val == "strict-origin-when-cross-origin" ||
+            val == "unsafe-url"
+        {
+            return val;
+        }
+    }
+    return DOMString::new();
 }
 
 pub(crate) fn referrer_policy_for_element(element: &Element) -> Option<ReferrerPolicy> {

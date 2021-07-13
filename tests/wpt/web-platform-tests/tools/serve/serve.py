@@ -4,24 +4,25 @@ from __future__ import print_function
 
 import abc
 import argparse
+import importlib
 import json
 import logging
+import multiprocessing
 import os
 import platform
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
 import traceback
-from six.moves import urllib
+import urllib
 import uuid
 from collections import defaultdict, OrderedDict
 from itertools import chain, product
-from multiprocessing import Process, Event
 
 from localpaths import repo_root
-from six.moves import reload_module
 
 from manifest.sourcefile import read_script_metadata, js_meta_re, parse_variants
 from wptserve import server as wptserve, handlers
@@ -72,7 +73,9 @@ class WrapperHandler(object):
         self.handler(request, response)
 
     def handle_request(self, request, response):
-        for header_name, header_value in self.headers:
+        headers = self.headers + handlers.load_headers(
+            request, self._get_filesystem_path(request))
+        for header_name, header_value in headers:
             response.headers.set(header_name, header_value)
 
         self.check_exposure(request)
@@ -110,13 +113,17 @@ class WrapperHandler(object):
                 path = replace_end(path, src, dest)
         return path
 
+    def _get_filesystem_path(self, request):
+        """Get the path of the underlying resource file on disk."""
+        return self._get_path(filesystem_path(self.base_path, request, self.url_base), False)
+
     def _get_metadata(self, request):
         """Get an iterator over script metadata based on // META comments in the
         associated js file.
 
         :param request: The Request being processed.
         """
-        path = self._get_path(filesystem_path(self.base_path, request, self.url_base), False)
+        path = self._get_filesystem_path(request)
         try:
             with open(path, "rb") as f:
                 for key, value in read_script_metadata(f, js_meta_re):
@@ -178,9 +185,9 @@ class HtmlWrapperHandler(WrapperHandler):
 
     def check_exposure(self, request):
         if self.global_type:
-            globals = b""
+            globals = u""
             for (key, value) in self._get_metadata(request):
-                if key == b"global":
+                if key == "global":
                     globals = value
                     break
 
@@ -189,23 +196,23 @@ class HtmlWrapperHandler(WrapperHandler):
                                     self.global_type)
 
     def _meta_replacement(self, key, value):
-        if key == b"timeout":
-            if value == b"long":
+        if key == "timeout":
+            if value == "long":
                 return '<meta name="timeout" content="long">'
-        if key == b"title":
-            value = value.decode('utf-8').replace("&", "&amp;").replace("<", "&lt;")
+        if key == "title":
+            value = value.replace("&", "&amp;").replace("<", "&lt;")
             return '<title>%s</title>' % value
         return None
 
     def _script_replacement(self, key, value):
-        if key == b"script":
-            attribute = value.decode('utf-8').replace("&", "&amp;").replace('"', "&quot;")
+        if key == "script":
+            attribute = value.replace("&", "&amp;").replace('"', "&quot;")
             return '<script src="%s"></script>' % attribute
         return None
 
 
 class WorkersHandler(HtmlWrapperHandler):
-    global_type = b"dedicatedworker"
+    global_type = "dedicatedworker"
     path_replace = [(".any.worker.html", ".any.js", ".any.worker.js"),
                     (".worker.html", ".worker.js")]
     wrapper = """<!doctype html>
@@ -216,6 +223,22 @@ class WorkersHandler(HtmlWrapperHandler):
 <div id=log></div>
 <script>
 fetch_tests_from_worker(new Worker("%(path)s%(query)s"));
+</script>
+"""
+
+
+class WorkerModulesHandler(HtmlWrapperHandler):
+    global_type = "dedicatedworker-module"
+    path_replace = [(".any.worker-module.html", ".any.js", ".any.worker-module.js"),
+                    (".worker.html", ".worker.js")]
+    wrapper = """<!doctype html>
+<meta charset=utf-8>
+%(meta)s
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<div id=log></div>
+<script>
+fetch_tests_from_worker(new Worker("%(path)s%(query)s", { type: "module" }));
 </script>
 """
 
@@ -234,7 +257,7 @@ class WindowHandler(HtmlWrapperHandler):
 
 
 class AnyHtmlHandler(HtmlWrapperHandler):
-    global_type = b"window"
+    global_type = "window"
     path_replace = [(".any.html", ".any.js")]
     wrapper = """<!doctype html>
 <meta charset=utf-8>
@@ -254,7 +277,7 @@ self.GLOBAL = {
 
 
 class SharedWorkersHandler(HtmlWrapperHandler):
-    global_type = b"sharedworker"
+    global_type = "sharedworker"
     path_replace = [(".any.sharedworker.html", ".any.js", ".any.worker.js")]
     wrapper = """<!doctype html>
 <meta charset=utf-8>
@@ -268,8 +291,23 @@ fetch_tests_from_worker(new SharedWorker("%(path)s%(query)s"));
 """
 
 
+class SharedWorkerModulesHandler(HtmlWrapperHandler):
+    global_type = "sharedworker-module"
+    path_replace = [(".any.sharedworker-module.html", ".any.js", ".any.worker-module.js")]
+    wrapper = """<!doctype html>
+<meta charset=utf-8>
+%(meta)s
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<div id=log></div>
+<script>
+fetch_tests_from_worker(new SharedWorker("%(path)s%(query)s", { type: "module" }));
+</script>
+"""
+
+
 class ServiceWorkersHandler(HtmlWrapperHandler):
-    global_type = b"serviceworker"
+    global_type = "serviceworker"
     path_replace = [(".any.serviceworker.html", ".any.js", ".any.worker.js")]
     wrapper = """<!doctype html>
 <meta charset=utf-8>
@@ -289,8 +327,54 @@ class ServiceWorkersHandler(HtmlWrapperHandler):
 """
 
 
-class AnyWorkerHandler(WrapperHandler):
+class ServiceWorkerModulesHandler(HtmlWrapperHandler):
+    global_type = "serviceworker-module"
+    path_replace = [(".any.serviceworker-module.html",
+                     ".any.js", ".any.worker-module.js")]
+    wrapper = """<!doctype html>
+<meta charset=utf-8>
+%(meta)s
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<div id=log></div>
+<script>
+(async function() {
+  const scope = 'does/not/exist';
+  let reg = await navigator.serviceWorker.getRegistration(scope);
+  if (reg) await reg.unregister();
+  reg = await navigator.serviceWorker.register(
+    "%(path)s%(query)s",
+    { scope, type: 'module' },
+  );
+  fetch_tests_from_worker(reg.installing);
+})();
+</script>
+"""
+
+
+class BaseWorkerHandler(WrapperHandler):
     headers = [('Content-Type', 'text/javascript')]
+
+    def _meta_replacement(self, key, value):
+        return None
+
+    @abc.abstractmethod
+    def _create_script_import(self, attribute):
+        # Take attribute (a string URL to a JS script) and return JS source to import the script
+        # into the worker.
+        pass
+
+    def _script_replacement(self, key, value):
+        if key == "script":
+            attribute = value.replace("\\", "\\\\").replace('"', '\\"')
+            return self._create_script_import(attribute)
+        if key == "title":
+            value = value.replace("\\", "\\\\").replace('"', '\\"')
+            return 'self.META_TITLE = "%s";' % value
+        return None
+
+
+class ClassicWorkerHandler(BaseWorkerHandler):
     path_replace = [(".any.worker.js", ".any.js")]
     wrapper = """%(meta)s
 self.GLOBAL = {
@@ -303,17 +387,25 @@ importScripts("%(path)s");
 done();
 """
 
-    def _meta_replacement(self, key, value):
-        return None
+    def _create_script_import(self, attribute):
+        return 'importScripts("%s")' % attribute
 
-    def _script_replacement(self, key, value):
-        if key == b"script":
-            attribute = value.decode('utf-8').replace("\\", "\\\\").replace('"', '\\"')
-            return 'importScripts("%s")' % attribute
-        if key == b"title":
-            value = value.decode('utf-8').replace("\\", "\\\\").replace('"', '\\"')
-            return 'self.META_TITLE = "%s";' % value
-        return None
+
+class ModuleWorkerHandler(BaseWorkerHandler):
+    path_replace = [(".any.worker-module.js", ".any.js")]
+    wrapper = """%(meta)s
+self.GLOBAL = {
+  isWindow: function() { return false; },
+  isWorker: function() { return true; },
+};
+import "/resources/testharness.js";
+%(script)s
+import "%(path)s";
+done();
+"""
+
+    def _create_script_import(self, attribute):
+        return 'import "%s";' % attribute
 
 
 rewrites = [("GET", "/resources/WebIDLParser.js", "/resources/webidl2/lib/webidl2.js")]
@@ -327,7 +419,8 @@ class RoutesBuilder(object):
 
         self.forbidden = [("*", "/_certs/*", handlers.ErrorHandler(404)),
                           ("*", "/tools/*", handlers.ErrorHandler(404)),
-                          ("*", "{spec}/tools/*", handlers.ErrorHandler(404))]
+                          ("*", "{spec}/tools/*", handlers.ErrorHandler(404)),
+                          ("*", "/results/", handlers.ErrorHandler(404))]
 
         self.extra = []
 
@@ -360,11 +453,15 @@ class RoutesBuilder(object):
 
         routes = [
             ("GET", "*.worker.html", WorkersHandler),
+            ("GET", "*.worker-module.html", WorkerModulesHandler),
             ("GET", "*.window.html", WindowHandler),
             ("GET", "*.any.html", AnyHtmlHandler),
             ("GET", "*.any.sharedworker.html", SharedWorkersHandler),
+            ("GET", "*.any.sharedworker-module.html", SharedWorkerModulesHandler),
             ("GET", "*.any.serviceworker.html", ServiceWorkersHandler),
-            ("GET", "*.any.worker.js", AnyWorkerHandler),
+            ("GET", "*.any.serviceworker-module.html", ServiceWorkerModulesHandler),
+            ("GET", "*.any.worker.js", ClassicWorkerHandler),
+            ("GET", "*.any.worker-module.js", ModuleWorkerHandler),
             ("GET", "*.asis", handlers.AsIsHandler),
             ("GET", "/.well-known/origin-policy", handlers.PythonScriptHandler),
             ("*", "*.py", handlers.PythonScriptHandler),
@@ -383,7 +480,7 @@ class RoutesBuilder(object):
         self.mountpoint_routes[file_url] = [("GET", file_url, handlers.FileHandler(base_path=base_path, url_base=url_base))]
 
 
-def build_routes(aliases):
+def get_route_builder(aliases, config=None):
     builder = RoutesBuilder()
     for alias in aliases:
         url = alias["url-path"]
@@ -395,27 +492,41 @@ def build_routes(aliases):
             builder.add_mount_point(url, directory)
         else:
             builder.add_file_mount_point(url, directory)
-    return builder.get_routes()
+    return builder
 
 
 class ServerProc(object):
-    def __init__(self, scheme=None):
+    def __init__(self, mp_context, scheme=None):
         self.proc = None
         self.daemon = None
-        self.stop = Event()
+        self.mp_context = mp_context
+        self.stop = mp_context.Event()
         self.scheme = scheme
 
     def start(self, init_func, host, port, paths, routes, bind_address, config, **kwargs):
-        self.proc = Process(target=self.create_daemon,
-                            args=(init_func, host, port, paths, routes, bind_address,
-                                  config),
-                            name='%s on port %s' % (self.scheme, port),
-                            kwargs=kwargs)
+        self.proc = self.mp_context.Process(target=self.create_daemon,
+                                            args=(init_func, host, port, paths, routes, bind_address,
+                                                  config),
+                                            name='%s on port %s' % (self.scheme, port),
+                                            kwargs=kwargs)
         self.proc.daemon = True
         self.proc.start()
 
     def create_daemon(self, init_func, host, port, paths, routes, bind_address,
                       config, **kwargs):
+        if sys.platform == "darwin":
+            # on Darwin, NOFILE starts with a very low limit (256), so bump it up a little
+            # by way of comparison, Debian starts with a limit of 1024, Windows 512
+            import resource  # local, as it only exists on Unix-like systems
+            maxfilesperproc = int(subprocess.check_output(
+                ["sysctl", "-n", "kern.maxfilesperproc"]
+            ).strip())
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            # 2048 is somewhat arbitrary, but gives us some headroom for wptrunner --parallel
+            # note that it's expected that 2048 will be the min here
+            new_soft = min(2048, maxfilesperproc, hard)
+            if soft < new_soft:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
         try:
             self.daemon = init_func(host, port, paths, routes, bind_address, config, **kwargs)
         except socket.error:
@@ -449,17 +560,16 @@ class ServerProc(object):
         return self.proc.is_alive()
 
 
-def check_subdomains(config):
+def check_subdomains(config, routes, mp_context):
     paths = config.paths
     bind_address = config.bind_address
-    aliases = config.aliases
 
     host = config.server_host
     port = get_port()
     logger.debug("Going to use port %d to check subdomains" % port)
 
-    wrapper = ServerProc()
-    wrapper.start(start_http_server, host, port, paths, build_routes(aliases),
+    wrapper = ServerProc(mp_context)
+    wrapper.start(start_http_server, host, port, paths, routes,
                   bind_address, config)
 
     url = "http://{}:{}/".format(host, port)
@@ -510,15 +620,16 @@ def make_hosts_file(config, host):
     return "".join(rv)
 
 
-def start_servers(host, ports, paths, routes, bind_address, config, **kwargs):
+def start_servers(host, ports, paths, routes, bind_address, config,
+                  mp_context, **kwargs):
     servers = defaultdict(list)
     for scheme, ports in ports.items():
-        assert len(ports) == {"http": 2}.get(scheme, 1)
+        assert len(ports) == {"http": 2, "https": 2}.get(scheme, 1)
 
         # If trying to start HTTP/2.0 server, check compatibility
         if scheme == 'h2' and not http2_compatible():
             logger.error('Cannot start HTTP/2.0 server as the environment is not compatible. ' +
-                         'Requires Python 2.7.10+ (< 3.0) and OpenSSL 1.0.2+')
+                         'Requires Python 2.7.10+ or 3.6+ and OpenSSL 1.0.2+')
             continue
 
         for port in ports:
@@ -528,9 +639,10 @@ def start_servers(host, ports, paths, routes, bind_address, config, **kwargs):
                          "https": start_https_server,
                          "h2": start_http2_server,
                          "ws": start_ws_server,
-                         "wss": start_wss_server}[scheme]
+                         "wss": start_wss_server,
+                         "quic-transport": start_quic_transport_server}[scheme]
 
-            server_proc = ServerProc(scheme=scheme)
+            server_proc = ServerProc(mp_context, scheme=scheme)
             server_proc.start(init_func, host, port, paths, routes, bind_address,
                               config, **kwargs)
             servers[scheme].append((port, server_proc))
@@ -588,6 +700,7 @@ def start_http2_server(host, port, paths, routes, bind_address, config, **kwargs
                                      port=port,
                                      handler_cls=wptserve.Http2WebTestRequestHandler,
                                      doc_root=paths["doc_root"],
+                                     ws_doc_root=paths["ws_doc_root"],
                                      routes=routes,
                                      rewrites=rewrites,
                                      bind_address=bind_address,
@@ -673,7 +786,7 @@ def release_mozlog_lock():
 def start_ws_server(host, port, paths, routes, bind_address, config, **kwargs):
     # Ensure that when we start this in a new process we have the global lock
     # in the logging module unlocked
-    reload_module(logging)
+    importlib.reload(logging)
     release_mozlog_lock()
     try:
         return WebSocketDaemon(host,
@@ -689,7 +802,7 @@ def start_ws_server(host, port, paths, routes, bind_address, config, **kwargs):
 def start_wss_server(host, port, paths, routes, bind_address, config, **kwargs):
     # Ensure that when we start this in a new process we have the global lock
     # in the logging module unlocked
-    reload_module(logging)
+    importlib.reload(logging)
     release_mozlog_lock()
     try:
         return WebSocketDaemon(host,
@@ -702,7 +815,64 @@ def start_wss_server(host, port, paths, routes, bind_address, config, **kwargs):
         startup_failed(log=False)
 
 
-def start(config, routes, **kwargs):
+class QuicTransportDaemon(object):
+    def __init__(self, host, port, handlers_path=None, private_key=None, certificate=None, log_level=None):
+        args = ["python3", "wpt", "serve-quic-transport"]
+        if host:
+            args += ["--host", host]
+        if port:
+            args += ["--port", str(port)]
+        if private_key:
+            args += ["--private-key", private_key]
+        if certificate:
+            args += ["--certificate", certificate]
+        if handlers_path:
+            args += ["--handlers-path", handlers_path]
+        if log_level == "debug":
+            args += ["--verbose"]
+        self.command = args
+        self.proc = None
+
+    def start(self, block=False):
+        if block:
+            subprocess.call(self.command)
+        else:
+            def handle_signal(*_):
+                if self.proc:
+                    try:
+                        self.proc.terminate()
+                    except OSError:
+                        # It's fine if the child already exits.
+                        pass
+                    self.proc.wait()
+                sys.exit(0)
+
+            signal.signal(signal.SIGTERM, handle_signal)
+            signal.signal(signal.SIGINT, handle_signal)
+
+            self.proc = subprocess.Popen(self.command)
+            # Give the server a second to start and then check.
+            time.sleep(1)
+            if self.proc.poll():
+                sys.exit(1)
+
+
+def start_quic_transport_server(host, port, paths, routes, bind_address, config, **kwargs):
+    # Ensure that when we start this in a new process we have the global lock
+    # in the logging module unlocked
+    importlib.reload(logging)
+    release_mozlog_lock()
+    try:
+        return QuicTransportDaemon(host,
+                          port,
+                          private_key=config.ssl_config["key_path"],
+                          certificate=config.ssl_config["cert_path"],
+                          log_level=config.log_level)
+    except Exception:
+        startup_failed(log=False)
+
+
+def start(config, routes, mp_context, **kwargs):
     host = config["server_host"]
     ports = config.ports
     paths = config.paths
@@ -710,7 +880,7 @@ def start(config, routes, **kwargs):
 
     logger.debug("Using ports: %r" % ports)
 
-    servers = start_servers(host, ports, paths, routes, bind_address, config, **kwargs)
+    servers = start_servers(host, ports, paths, routes, bind_address, config, mp_context, **kwargs)
 
     return servers
 
@@ -719,43 +889,6 @@ def iter_procs(servers):
     for servers in servers.values():
         for port, server in servers:
             yield server.proc
-
-
-def build_config(override_path=None, **kwargs):
-    rv = ConfigBuilder()
-
-    enable_http2 = kwargs.get("h2")
-    if enable_http2 is None:
-        enable_http2 = True
-    if enable_http2:
-        rv._default["ports"]["h2"] = [9000]
-
-    if override_path and os.path.exists(override_path):
-        with open(override_path) as f:
-            override_obj = json.load(f)
-        rv.update(override_obj)
-
-    if kwargs.get("config_path"):
-        other_path = os.path.abspath(os.path.expanduser(kwargs.get("config_path")))
-        if os.path.exists(other_path):
-            with open(other_path) as f:
-                override_obj = json.load(f)
-            rv.update(override_obj)
-        else:
-            raise ValueError("Config path %s does not exist" % other_path)
-
-    overriding_path_args = [("doc_root", "Document root"),
-                            ("ws_doc_root", "WebSockets document root")]
-    for key, title in overriding_path_args:
-        value = kwargs.get(key)
-        if value is None:
-            continue
-        value = os.path.abspath(os.path.expanduser(value))
-        if not os.path.exists(value):
-            raise ValueError("%s path %s does not exist" % (title, value))
-        setattr(rv, key, value)
-
-    return rv
 
 
 def _make_subdomains_product(s, depth=2):
@@ -800,12 +933,12 @@ class ConfigBuilder(config.ConfigBuilder):
         "server_host": None,
         "ports": {
             "http": [8000, "auto"],
-            "https": [8443],
+            "https": [8443, 8444],
             "ws": ["auto"],
             "wss": ["auto"],
         },
         "check_subdomains": True,
-        "log_level": "debug",
+        "log_level": "info",
         "bind_address": True,
         "ssl": {
             "type": "pregenerated",
@@ -864,6 +997,46 @@ class ConfigBuilder(config.ConfigBuilder):
         return rv
 
 
+def build_config(override_path=None, config_cls=ConfigBuilder, **kwargs):
+    rv = config_cls()
+
+    enable_http2 = kwargs.get("h2")
+    if enable_http2 is None:
+        enable_http2 = True
+    if enable_http2:
+        rv._default["ports"]["h2"] = [9000]
+
+    if override_path and os.path.exists(override_path):
+        with open(override_path) as f:
+            override_obj = json.load(f)
+        rv.update(override_obj)
+
+    if kwargs.get("config_path"):
+        other_path = os.path.abspath(os.path.expanduser(kwargs.get("config_path")))
+        if os.path.exists(other_path):
+            with open(other_path) as f:
+                override_obj = json.load(f)
+            rv.update(override_obj)
+        else:
+            raise ValueError("Config path %s does not exist" % other_path)
+
+    if kwargs.get("verbose"):
+        rv.log_level = "debug"
+
+    overriding_path_args = [("doc_root", "Document root"),
+                            ("ws_doc_root", "WebSockets document root")]
+    for key, title in overriding_path_args:
+        value = kwargs.get(key)
+        if value is None:
+            continue
+        value = os.path.abspath(os.path.expanduser(value))
+        if not os.path.exists(value):
+            raise ValueError("%s path %s does not exist" % (title, value))
+        setattr(rv, key, value)
+
+    return rv
+
+
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--latency", type=int,
@@ -880,13 +1053,30 @@ def get_parser():
                         help=argparse.SUPPRESS)
     parser.add_argument("--no-h2", action="store_false", dest="h2", default=None,
                         help="Disable the HTTP/2.0 server")
+    parser.add_argument("--quic-transport", action="store_true", help="Enable QUIC server for WebTransport")
+    parser.add_argument("--exit-after-start", action="store_true", help="Exit after starting servers")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.set_defaults(report=False)
+    parser.set_defaults(is_wave=False)
     return parser
 
 
-def run(**kwargs):
+class MpContext(object):
+    def __getattr__(self, name):
+        return getattr(multiprocessing, name)
+
+
+def run(config_cls=ConfigBuilder, route_builder=None, mp_context=None, **kwargs):
     received_signal = threading.Event()
 
+    if mp_context is None:
+        if hasattr(multiprocessing, "get_context"):
+            mp_context = multiprocessing.get_context()
+        else:
+            mp_context = MpContext()
+
     with build_config(os.path.join(repo_root, "config.json"),
+                      config_cls=config_cls,
                       **kwargs) as config:
         global logger
         logger = config.logger
@@ -909,8 +1099,12 @@ def run(**kwargs):
                         'local-dir': doc_root,
                     })
 
+        if route_builder is None:
+            route_builder = get_route_builder
+        routes = route_builder(config.aliases, config).get_routes()
+
         if config["check_subdomains"]:
-            check_subdomains(config)
+            check_subdomains(config, routes, mp_context)
 
         stash_address = None
         if bind_address:
@@ -918,21 +1112,26 @@ def run(**kwargs):
             logger.debug("Going to use port %d for stash" % stash_address[1])
 
         with stash.StashServer(stash_address, authkey=str(uuid.uuid4())):
-            servers = start(config, build_routes(config["aliases"]), **kwargs)
+            servers = start(config, routes, mp_context, **kwargs)
             signal.signal(signal.SIGTERM, handle_signal)
             signal.signal(signal.SIGINT, handle_signal)
 
-            while (all(item.is_alive() for item in iter_procs(servers)) and
-                   not received_signal.is_set()):
-                for item in iter_procs(servers):
-                    item.join(1)
-            exited = [item for item in iter_procs(servers) if not item.is_alive()]
-            subject = "subprocess" if len(exited) == 1 else "subprocesses"
+            while (all(subproc.is_alive() for subproc in iter_procs(servers)) and
+                   not received_signal.is_set() and not kwargs["exit_after_start"]):
+                for subproc in iter_procs(servers):
+                    subproc.join(1)
 
-            logger.info("%s %s exited:" % (len(exited), subject))
-
-            for item in iter_procs(servers):
-                logger.info("Status of %s:\t%s" % (item.name, "running" if item.is_alive() else "not running"))
+            failed_subproc = 0
+            for subproc in iter_procs(servers):
+                if subproc.is_alive():
+                    logger.info('Status of subprocess "%s": running' % subproc.name)
+                else:
+                    if subproc.exitcode == 0:
+                        logger.info('Status of subprocess "%s": exited correctly' % subproc.name)
+                    else:
+                        logger.warning('Status of subprocess "%s": failed. Exit with non-zero status: %d' % (subproc.name, subproc.exitcode))
+                        failed_subproc += 1
+            return failed_subproc
 
 
 def main():

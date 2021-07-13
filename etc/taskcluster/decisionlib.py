@@ -28,7 +28,7 @@ import taskcluster
 # Public API
 __all__ = [
     "CONFIG", "SHARED", "Task", "DockerWorkerTask",
-    "GenericWorkerTask", "WindowsGenericWorkerTask", "MacOsGenericWorkerTask",
+    "GenericWorkerTask", "WindowsGenericWorkerTask",
     "make_repo_bundle",
 ]
 
@@ -304,7 +304,7 @@ class Task:
     def with_curl_script(self, url, file_path):
         return self \
         .with_script("""
-            curl --retry 5 --connect-timeout 10 -Lf "%s" -o "%s"
+            curl --compressed --retry 5 --connect-timeout 10 -Lf "%s" -o "%s"
         """ % (url, file_path))
 
     def with_curl_artifact_script(self, task_id, artifact_name, out_directory=""):
@@ -387,7 +387,10 @@ class GenericWorkerTask(Task):
 
         Paths are relative to the task’s home directory.
         """
-        self.artifacts.extend((type, path) for path in paths)
+        for path in paths:
+            if (type, path) in self.artifacts:
+                raise ValueError("Duplicate artifact: " + path)  # pragma: no cover
+            self.artifacts.append(tuple((type, path)))
         return self
 
     def with_features(self, *names):
@@ -471,9 +474,13 @@ class WindowsGenericWorkerTask(GenericWorkerTask):
         if self.rdp_info_artifact_name:
             rdp_scope = "generic-worker:allow-rdp:%s/%s" % (self.provisioner_id, self.worker_type)
             self.scopes.append(rdp_scope)
+        self.scopes.append("generic-worker:os-group:proj-servo/win2016/Administrators")
+        self.scopes.append("generic-worker:run-as-administrator:proj-servo/win2016")
+        self.with_features("runAsAdministrator")
         return dict_update_if_truthy(
             super().build_worker_payload(),
             rdpInfo=self.rdp_info_artifact_name,
+            osGroups=["Administrators"]
         )
 
     def with_rdp_info(self, *, artifact_name):
@@ -555,10 +562,10 @@ class WindowsGenericWorkerTask(GenericWorkerTask):
 
     def with_curl(self):
         return self \
-        .with_path_from_homedir("curl\\curl-7.69.0-win64-mingw\\bin") \
+        .with_path_from_homedir("curl\\curl-7.73.0-win64-mingw\\bin") \
         .with_directory_mount(
-            "https://curl.haxx.se/windows/dl-7.69.0/curl-7.69.0-win64-mingw.zip",
-            sha256="1c3caf39bf8ad2794b0515a09b3282f85a7ccfcf753ea639f2ef99e50351ade0",
+            "https://curl.haxx.se/windows/dl-7.73.0/curl-7.73.0-win64-mingw.zip",
+            sha256="2e1ffdb6c25c8648a1243bb3a268120be442399b1c93d7da309bba235ecdab9a",
             path="curl",
         )
 
@@ -616,26 +623,23 @@ class WindowsGenericWorkerTask(GenericWorkerTask):
         .with_dependencies(repack_task) \
         .with_directory_mount("public/repacked.zip", task_id=repack_task, path=path)
 
-    def with_python2(self):
+    def with_python3(self):
         """
-        Make Python 2, pip, and virtualenv accessible to the task’s commands.
-
         For Python 3, use `with_directory_mount` and the "embeddable zip file" distribution
         from python.org.
         You may need to remove `python37._pth` from the ZIP in order to work around
         <https://bugs.python.org/issue34841>.
         """
-        return self \
-        .with_repacked_msi(
-            "https://www.python.org/ftp/python/2.7.15/python-2.7.15.amd64.msi",
-            sha256="5e85f3c4c209de98480acbf2ba2e71a907fd5567a838ad4b6748c76deb286ad7",
-            path="python2"
-        ) \
-        .with_early_script("""
-            python -m ensurepip
-            pip install virtualenv==16.0.0
-        """) \
-        .with_path_from_homedir("python2", "python2\\Scripts")
+        return (
+            self
+            .with_curl_script(
+                "https://www.python.org/ftp/python/3.7.3/python-3.7.3-amd64.exe",
+                "do-the-python.exe"
+            )
+            .with_script("do-the-python.exe /quiet TargetDir=%HOMEDRIVE%%HOMEPATH%\\python3")
+            .with_path_from_homedir("python3", "python3\\Scripts")
+            .with_script("pip install virtualenv==20.2.1")
+        )
 
 
 class UnixTaskMixin(Task):
@@ -669,52 +673,6 @@ class UnixTaskMixin(Task):
         ))
 
 
-class MacOsGenericWorkerTask(UnixTaskMixin, GenericWorkerTask):
-    """
-    Task definition for a `generic-worker` task running on macOS.
-
-    Scripts are interpreted with `bash`.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.scripts = []
-
-    with_script = chaining(append_to_attr, "scripts")
-    with_early_script = chaining(prepend_to_attr, "scripts")
-
-    def build_command(self):
-        # generic-worker accepts multiple commands, but unlike on Windows
-        # the current directory and environment variables
-        # are not preserved across commands on macOS.
-        # So concatenate scripts and use a single `bash` command instead.
-        return [
-            [
-                "/bin/bash", "--login", "-x", "-e", "-o", "pipefail", "-c",
-                deindent("\n".join(self.scripts))
-            ]
-        ]
-
-    def with_python2(self):
-        return self.with_early_script("""
-            export PATH="$HOME/Library/Python/2.7/bin:$PATH"
-            python -m ensurepip --user
-            pip install --user virtualenv
-        """)
-
-    def with_python3(self):
-        return self.with_early_script("""
-            python3 -m ensurepip --user
-            python3 -m pip install --user virtualenv
-        """)
-
-    def with_rustup(self):
-        return self.with_early_script("""
-            export PATH="$HOME/.cargo/bin:$PATH"
-            which rustup || curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain none -y
-            rustup self update
-        """)
-
-
 class DockerWorkerTask(UnixTaskMixin, Task):
     """
     Task definition for a worker type that runs the `generic-worker` implementation.
@@ -736,12 +694,18 @@ class DockerWorkerTask(UnixTaskMixin, Task):
 
     with_docker_image = chaining(setattr, "docker_image")
     with_max_run_time_minutes = chaining(setattr, "max_run_time_minutes")
-    with_artifacts = chaining(append_to_attr, "artifacts")
     with_script = chaining(append_to_attr, "scripts")
     with_early_script = chaining(prepend_to_attr, "scripts")
     with_caches = chaining(update_attr, "caches")
     with_env = chaining(update_attr, "env")
     with_capabilities = chaining(update_attr, "capabilities")
+
+    def with_artifacts(self, *paths):
+        for path in paths:
+            if path in self.artifacts:
+                raise ValueError("Duplicate artifact: " + path)  # pragma: no cover
+            self.artifacts.append(path)
+        return self
 
     def build_worker_payload(self):
         """

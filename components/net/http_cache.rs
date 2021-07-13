@@ -230,8 +230,8 @@ fn get_response_expiry(response: &Response) -> Duration {
         let max_heuristic = Duration::hours(24) - age;
         let heuristic_freshness = if let Some(last_modified) =
             // If the response has a Last-Modified header field,
-        // caches are encouraged to use a heuristic expiration value
-        // that is no more than some fraction of the interval since that time.
+            // caches are encouraged to use a heuristic expiration value
+            // that is no more than some fraction of the interval since that time.
             response.headers.typed_get::<LastModified>()
         {
             let current = time::now().to_timespec();
@@ -901,5 +901,10 @@ impl HttpCache {
         // TODO: Complete incomplete responses, including 206 response, when stored here.
         // See A cache MAY complete a stored incomplete response by making a subsequent range request
         // https://tools.ietf.org/html/rfc7234#section-3.1
+    }
+
+    /// Clear the contents of this cache.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 }

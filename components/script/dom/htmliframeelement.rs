@@ -30,7 +30,6 @@ use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use ipc_channel::ipc;
 use msg::constellation_msg::{BrowsingContextId, PipelineId, TopLevelBrowsingContextId};
-use net_traits::request::Referrer;
 use profile_traits::ipc as ProfiledIpc;
 use script_layout_interface::message::ReflowGoal;
 use script_traits::IFrameSandboxState::{IFrameSandboxed, IFrameUnsandboxed};
@@ -39,6 +38,7 @@ use script_traits::{
     LoadOrigin, UpdatePipelineIdReason, WindowSizeData,
 };
 use script_traits::{NewLayoutInfo, ScriptMsg};
+use servo_atoms::Atom;
 use servo_url::ServoUrl;
 use std::cell::Cell;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
@@ -170,6 +170,7 @@ impl HTMLIFrameElement {
             top_level_browsing_context_id: top_level_browsing_context_id,
             new_pipeline_id: new_pipeline_id,
             is_private: false, // FIXME
+            inherited_secure_context: load_data.inherited_secure_context,
             replace: replace,
         };
 
@@ -242,14 +243,15 @@ impl HTMLIFrameElement {
                 LoadOrigin::Script(document.origin().immutable().clone()),
                 url,
                 pipeline_id,
-                Some(Referrer::ReferrerUrl(document.url())),
+                window.upcast::<GlobalScope>().get_referrer(),
                 document.get_referrer_policy(),
+                Some(window.upcast::<GlobalScope>().is_secure_context()),
             );
             let element = self.upcast::<Element>();
             load_data.srcdoc = String::from(element.get_string_attribute(&local_name!("srcdoc")));
             self.navigate_or_reload_child_browsing_context(
                 load_data,
-                NavigationType::InitialAboutBlank,
+                NavigationType::Regular,
                 HistoryEntryReplacement::Disabled,
             );
             return;
@@ -325,8 +327,9 @@ impl HTMLIFrameElement {
             LoadOrigin::Script(document.origin().immutable().clone()),
             url,
             creator_pipeline_id,
-            Some(Referrer::ReferrerUrl(document.url())),
+            window.upcast::<GlobalScope>().get_referrer(),
             document.get_referrer_policy(),
+            Some(window.upcast::<GlobalScope>().is_secure_context()),
         );
 
         let pipeline_id = self.pipeline_id();
@@ -352,8 +355,9 @@ impl HTMLIFrameElement {
             LoadOrigin::Script(document.origin().immutable().clone()),
             url,
             pipeline_id,
-            Some(Referrer::ReferrerUrl(document.url().clone())),
+            window.upcast::<GlobalScope>().get_referrer(),
             document.get_referrer_policy(),
+            Some(window.upcast::<GlobalScope>().is_secure_context()),
         );
         let browsing_context_id = BrowsingContextId::new();
         let top_level_browsing_context_id = window.window_proxy().top_level_browsing_context_id();
@@ -531,8 +535,20 @@ impl HTMLIFrameElementMethods for HTMLIFrameElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-iframe-sandbox
     fn Sandbox(&self) -> DomRoot<DOMTokenList> {
-        self.sandbox
-            .or_init(|| DOMTokenList::new(self.upcast::<Element>(), &local_name!("sandbox")))
+        self.sandbox.or_init(|| {
+            DOMTokenList::new(
+                self.upcast::<Element>(),
+                &local_name!("sandbox"),
+                Some(vec![
+                    Atom::from("allow-same-origin"),
+                    Atom::from("allow-forms"),
+                    Atom::from("allow-pointer-lock"),
+                    Atom::from("allow-popups"),
+                    Atom::from("allow-scripts"),
+                    Atom::from("allow-top-navigation"),
+                ]),
+            )
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-iframe-contentwindow

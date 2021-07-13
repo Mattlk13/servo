@@ -24,6 +24,7 @@ interface mixin WindowOrWorkerGlobalScope {
   void queueMicrotask(VoidFunction callback);
 
   // ImageBitmap
+  [Pref="dom.imagebitmap.enabled"]
   Promise<ImageBitmap> createImageBitmap(ImageBitmapSource image, optional ImageBitmapOptions options = {});
   // Promise<ImageBitmap> createImageBitmap(
   //   ImageBitmapSource image, long sx, long sy, long sw, long sh, optional ImageBitmapOptions options);
@@ -33,6 +34,11 @@ interface mixin WindowOrWorkerGlobalScope {
 partial interface mixin WindowOrWorkerGlobalScope {
     [Replaceable]
     readonly attribute Performance performance;
+};
+
+// https://w3c.github.io/webappsec-secure-contexts/#monkey-patching-global-object
+partial interface mixin WindowOrWorkerGlobalScope {
+  readonly attribute boolean isSecureContext;
 };
 
 Window includes WindowOrWorkerGlobalScope;

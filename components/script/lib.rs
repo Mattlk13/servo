@@ -2,7 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![feature(const_fn)]
+#![feature(const_fn_fn_ptr_basics)]
+#![feature(const_fn_trait_bound)]
 #![feature(core_intrinsics)]
 #![feature(drain_filter)]
 #![feature(plugin)]
@@ -91,8 +92,6 @@ pub mod script_runtime;
 pub mod script_thread;
 #[warn(deprecated)]
 pub mod serviceworker_manager;
-#[warn(deprecated)]
-mod serviceworkerjob;
 #[warn(deprecated)]
 mod stylesheet_loader;
 #[warn(deprecated)]

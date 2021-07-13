@@ -13,7 +13,7 @@ from ..executors.executorservodriver import (ServoWebDriverTestharnessExecutor, 
                                              ServoWebDriverRefTestExecutor)  # noqa: F401
 from ..process import cast_env
 
-here = os.path.join(os.path.split(__file__)[0])
+here = os.path.dirname(__file__)
 
 __wptrunner__ = {
     "product": "servodriver",
@@ -36,7 +36,7 @@ def check_args(**kwargs):
     require_arg(kwargs, "binary")
 
 
-def browser_kwargs(test_type, run_info_data, config, **kwargs):
+def browser_kwargs(logger, test_type, run_info_data, config, **kwargs):
     return {
         "binary": kwargs["binary"],
         "binary_args": kwargs["binary_args"],
@@ -47,7 +47,7 @@ def browser_kwargs(test_type, run_info_data, config, **kwargs):
     }
 
 
-def executor_kwargs(test_type, server_config, cache_manager, run_info_data, **kwargs):
+def executor_kwargs(logger, test_type, server_config, cache_manager, run_info_data, **kwargs):
     rv = base_executor_kwargs(test_type, server_config,
                               cache_manager, run_info_data, **kwargs)
     return rv
@@ -77,7 +77,8 @@ class ServoWebDriverBrowser(Browser):
     init_timeout = 300  # Large timeout for cases where we're booting an Android emulator
 
     def __init__(self, logger, binary, debug_info=None, webdriver_host="127.0.0.1",
-                 server_config=None, binary_args=None, user_stylesheets=None, headless=None):
+                 server_config=None, binary_args=None,
+                 user_stylesheets=None, headless=None, **kwargs):
         Browser.__init__(self, logger)
         self.binary = binary
         self.binary_args = binary_args or []

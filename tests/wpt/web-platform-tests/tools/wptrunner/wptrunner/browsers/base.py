@@ -3,11 +3,10 @@ import platform
 import socket
 from abc import ABCMeta, abstractmethod
 from copy import deepcopy
-from six import iteritems
 
 from ..wptcommandline import require_arg  # noqa: F401
 
-here = os.path.split(__file__)[0]
+here = os.path.dirname(__file__)
 
 
 def inherit(super_module, child_globals, product_name):
@@ -126,6 +125,12 @@ class Browser(object):
         pass
 
     def settings(self, test):
+        """Dictionary of metadata that is constant for a specific launch of a browser.
+
+        This is used to determine when the browser instance configuration changes, requiring
+        a relaunch of the browser. The test runner calls this method for each test, and if the
+        returned value differs from that for the previous test, the browser is relaunched.
+        """
         return {}
 
     @abstractmethod
@@ -156,6 +161,10 @@ class Browser(object):
         """Returns the ExecutorBrowser subclass for this Browser subclass and the keyword arguments
         with which it should be instantiated"""
         return ExecutorBrowser, {}
+
+    def maybe_parse_tombstone(self):
+        """Possibly parse tombstones on Android device for Android target"""
+        pass
 
     def check_crash(self, process, test):
         """Check if a crash occured and output any useful information to the
@@ -196,5 +205,5 @@ class ExecutorBrowser(object):
     up the browser from the runner process.
     """
     def __init__(self, **kwargs):
-        for k, v in iteritems(kwargs):
+        for k, v in kwargs.items():
             setattr(self, k, v)

@@ -38,6 +38,7 @@ use crate::dom::nodelist::NodeList;
 use crate::dom::window::Window;
 use crate::dom::xmlserializer::XMLSerializer;
 use crate::realms::enter_realm;
+use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::JSContext as SafeJSContext;
 use crate::script_thread::{Documents, ScriptThread};
 use cookie::Cookie;
@@ -47,7 +48,7 @@ use ipc_channel::ipc::{self, IpcSender};
 use js::jsapi::{HandleValueArray, JSAutoRealm, JSContext, JSType, JS_IsExceptionPending};
 use js::jsval::UndefinedValue;
 use js::rust::wrappers::{JS_CallFunctionName, JS_GetProperty, JS_HasOwnProperty, JS_TypeOfValue};
-use js::rust::{Handle, HandleObject, HandleValue};
+use js::rust::{HandleObject, HandleValue};
 use msg::constellation_msg::BrowsingContextId;
 use msg::constellation_msg::PipelineId;
 use net_traits::CookieSource::{NonHTTP, HTTP};
@@ -255,7 +256,7 @@ pub unsafe fn jsval_to_webdriver(
                 &mut HandleValueArray::new(),
                 value.handle_mut(),
             ) {
-                jsval_to_webdriver(cx, global_scope, Handle::new(&value))
+                jsval_to_webdriver(cx, global_scope, value.handle())
             } else {
                 throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
                 Err(WebDriverJSError::JSError)
@@ -297,9 +298,13 @@ pub fn handle_execute_script(
             let result = unsafe {
                 let cx = window.get_cx();
                 rooted!(in(*cx) let mut rval = UndefinedValue());
-                window
-                    .upcast::<GlobalScope>()
-                    .evaluate_js_on_global_with_result(&eval, rval.handle_mut());
+                let global = window.upcast::<GlobalScope>();
+                global.evaluate_js_on_global_with_result(
+                    &eval,
+                    rval.handle_mut(),
+                    ScriptFetchOptions::default_classic_script(&global),
+                    global.api_base_url(),
+                );
                 jsval_to_webdriver(*cx, &window.upcast::<GlobalScope>(), rval.handle())
             };
 
@@ -323,9 +328,13 @@ pub fn handle_execute_async_script(
             let cx = window.get_cx();
             window.set_webdriver_script_chan(Some(reply));
             rooted!(in(*cx) let mut rval = UndefinedValue());
-            window
-                .upcast::<GlobalScope>()
-                .evaluate_js_on_global_with_result(&eval, rval.handle_mut());
+            let global = window.upcast::<GlobalScope>();
+            global.evaluate_js_on_global_with_result(
+                &eval,
+                rval.handle_mut(),
+                ScriptFetchOptions::default_classic_script(&global),
+                global.api_base_url(),
+            );
         },
         None => {
             reply

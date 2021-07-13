@@ -7,15 +7,15 @@
 
 use crate::context::QuirksMode;
 use crate::dom::{TDocument, TElement, TNode, TShadowRoot};
+use crate::invalidation::element::invalidation_map::Dependency;
 use crate::invalidation::element::invalidator::{DescendantInvalidationLists, Invalidation};
 use crate::invalidation::element::invalidator::{InvalidationProcessor, InvalidationVector};
-use crate::Atom;
+use crate::values::AtomIdent;
 use selectors::attr::CaseSensitivity;
 use selectors::matching::{self, MatchingContext, MatchingMode};
 use selectors::parser::{Combinator, Component, LocalName, SelectorImpl};
 use selectors::{Element, NthIndexCache, SelectorList};
 use smallvec::SmallVec;
-use std::borrow::Borrow;
 
 /// <https://dom.spec.whatwg.org/#dom-element-matches>
 pub fn element_matches<E>(
@@ -130,7 +130,7 @@ where
 {
     results: &'a mut Q::Output,
     matching_context: MatchingContext<'a, E::Impl>,
-    selector_list: &'a SelectorList<E::Impl>,
+    dependencies: &'a [Dependency],
 }
 
 impl<'a, E, Q> InvalidationProcessor<'a, E> for QuerySelectorProcessor<'a, E, Q>
@@ -140,6 +140,14 @@ where
     Q::Output: 'a,
 {
     fn light_tree_only(&self) -> bool {
+        true
+    }
+
+    fn check_outer_dependency(&mut self, _: &Dependency, _: E) -> bool {
+        debug_assert!(
+            false,
+            "How? We should only have parent-less dependencies here!"
+        );
         true
     }
 
@@ -171,11 +179,10 @@ where
             self_invalidations
         };
 
-        for selector in self.selector_list.0.iter() {
+        for dependency in self.dependencies.iter() {
             target_vector.push(Invalidation::new(
-                selector,
+                dependency,
                 self.matching_context.current_host.clone(),
-                0,
             ))
         }
 
@@ -268,7 +275,7 @@ where
 /// or shadow root that `root` is connected to.
 fn fast_connected_elements_with_id<'a, N>(
     root: N,
-    id: &Atom,
+    id: &AtomIdent,
     quirks_mode: QuirksMode,
 ) -> Result<&'a [N::ConcreteElement], ()>
 where
@@ -297,7 +304,7 @@ where
 /// Collects elements with a given id under `root`, that pass `filter`.
 fn collect_elements_with_id<E, Q, F>(
     root: E::ConcreteNode,
-    id: &Atom,
+    id: &AtomIdent,
     results: &mut Q::Output,
     quirks_mode: QuirksMode,
     mut filter: F,
@@ -346,11 +353,14 @@ where
         ref name,
         ref lower_name,
     } = *local_name;
-    if element.is_html_element_in_html_document() {
-        element.local_name() == lower_name.borrow()
+
+    let chosen_name = if element.is_html_element_in_html_document() {
+        lower_name
     } else {
-        element.local_name() == name.borrow()
-    }
+        name
+    };
+
+    element.local_name() == &**chosen_name
 }
 
 /// Fast paths for querySelector with a single simple selector.
@@ -390,7 +400,7 @@ where
 }
 
 enum SimpleFilter<'a, Impl: SelectorImpl> {
-    Class(&'a Atom),
+    Class(&'a AtomIdent),
     LocalName(&'a LocalName<Impl>),
 }
 
@@ -642,10 +652,15 @@ pub fn query_selector<E, Q>(
     if root_element.is_some() || !invalidation_may_be_useful {
         query_selector_slow::<E, Q>(root, selector_list, results, &mut matching_context);
     } else {
+        let dependencies = selector_list
+            .0
+            .iter()
+            .map(|selector| Dependency::for_full_selector_invalidation(selector.clone()))
+            .collect::<SmallVec<[_; 5]>>();
         let mut processor = QuerySelectorProcessor::<E, Q> {
             results,
             matching_context,
-            selector_list,
+            dependencies: &dependencies,
         };
 
         for node in root.dom_children() {

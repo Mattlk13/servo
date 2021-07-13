@@ -4,14 +4,8 @@
 
 //! Servo's compiler plugin/macro crate
 //!
-//! Attributes this crate provides:
-//!
-//!  - `#[derive(DenyPublicFields)]` : Forces all fields in a struct/enum to be private
-//!  - `#[derive(JSTraceable)]` : Auto-derives an implementation of `JSTraceable` for a struct in the script crate
-//!  - `#[unrooted_must_root_lint::must_root]` : Prevents data of the marked type from being used on the stack.
-//!                     See the lints module for more details
-//!  - `#[dom_struct]` : Implies #[derive(JSTraceable, DenyPublicFields)]`, and `#[unrooted_must_root_lint::must_root]`.
-//!                       Use this for structs that correspond to a DOM type
+//! This crate provides the `#[unrooted_must_root_lint::must_root]` lint. This lint prevents data
+//! of the marked type from being used on the stack. See the source for more details.
 
 #![deny(unsafe_code)]
 #![feature(plugin)]
@@ -90,7 +84,7 @@ fn has_lint_attr(sym: &Symbols, attrs: &[Attribute], name: Symbol) -> bool {
     attrs.iter().any(|attr| {
         matches!(
             &attr.kind,
-            AttrKind::Normal(attr_item)
+            AttrKind::Normal(attr_item, _)
             if attr_item.path.segments.len() == 2 &&
             attr_item.path.segments[0].ident.name == sym.unrooted_must_root_lint &&
             attr_item.path.segments[1].ident.name == name
@@ -110,7 +104,7 @@ fn is_unrooted_ty(sym: &Symbols, cx: &LateContext, ty: &ty::TyS, in_new_function
                 continue;
             },
         };
-        let recur_into_subtree = match t.kind {
+        let recur_into_subtree = match t.kind() {
             ty::Adt(did, substs) => {
                 let has_attr = |did, name| has_lint_attr(sym, &cx.tcx.get_attrs(did), name);
                 if has_attr(did.did, sym.must_root) {
@@ -121,7 +115,7 @@ fn is_unrooted_ty(sym: &Symbols, cx: &LateContext, ty: &ty::TyS, in_new_function
                 } else if match_def_path(cx, did.did, &[sym.alloc, sym.rc, sym.Rc]) {
                     // Rc<Promise> is okay
                     let inner = substs.type_at(0);
-                    if let ty::Adt(did, _) = inner.kind {
+                    if let ty::Adt(did, _) = inner.kind() {
                         if has_attr(did.did, sym.allow_unrooted_in_rc) {
                             false
                         } else {
@@ -132,8 +126,12 @@ fn is_unrooted_ty(sym: &Symbols, cx: &LateContext, ty: &ty::TyS, in_new_function
                     }
                 } else if match_def_path(cx, did.did, &[sym::core, sym.cell, sym.Ref]) ||
                     match_def_path(cx, did.did, &[sym::core, sym.cell, sym.RefMut]) ||
-                    match_def_path(cx, did.did, &[sym::core, sym.slice, sym.Iter]) ||
-                    match_def_path(cx, did.did, &[sym::core, sym.slice, sym.IterMut]) ||
+                    match_def_path(cx, did.did, &[sym::core, sym::slice, sym::iter, sym.Iter]) ||
+                    match_def_path(
+                        cx,
+                        did.did,
+                        &[sym::core, sym::slice, sym::iter, sym.IterMut],
+                    ) ||
                     match_def_path(cx, did.did, &[sym.accountable_refcell, sym.Ref]) ||
                     match_def_path(cx, did.did, &[sym.accountable_refcell, sym.RefMut]) ||
                     match_def_path(
@@ -202,11 +200,12 @@ impl LintPass for UnrootedPass {
     }
 }
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnrootedPass {
+impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
     /// All structs containing #[unrooted_must_root_lint::must_root] types
     /// must be #[unrooted_must_root_lint::must_root] themselves
-    fn check_item(&mut self, cx: &LateContext<'a, 'tcx>, item: &'tcx hir::Item) {
-        if has_lint_attr(&self.symbols, &item.attrs, self.symbols.must_root) {
+    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item) {
+        let attrs = cx.tcx.hir().attrs(item.hir_id());
+        if has_lint_attr(&self.symbols, &attrs, self.symbols.must_root) {
             return;
         }
         if let hir::ItemKind::Struct(def, ..) = &item.kind {
@@ -231,7 +230,8 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnrootedPass {
     fn check_variant(&mut self, cx: &LateContext, var: &hir::Variant) {
         let ref map = cx.tcx.hir();
         let parent_item = map.expect_item(map.get_parent_item(var.id));
-        if !has_lint_attr(&self.symbols, &parent_item.attrs, self.symbols.must_root) {
+        let attrs = cx.tcx.hir().attrs(parent_item.hir_id());
+        if !has_lint_attr(&self.symbols, &attrs, self.symbols.must_root) {
             match var.data {
                 hir::VariantData::Tuple(fields, ..) => {
                     for field in fields {
@@ -256,7 +256,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnrootedPass {
     /// Function arguments that are #[unrooted_must_root_lint::must_root] types are not allowed
     fn check_fn(
         &mut self,
-        cx: &LateContext<'a, 'tcx>,
+        cx: &LateContext<'tcx>,
         kind: visit::FnKind<'tcx>,
         decl: &'tcx hir::FnDecl,
         body: &'tcx hir::Body,
@@ -264,10 +264,10 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnrootedPass {
         id: HirId,
     ) {
         let in_new_function = match kind {
-            visit::FnKind::ItemFn(n, _, _, _, _) | visit::FnKind::Method(n, _, _, _) => {
+            visit::FnKind::ItemFn(n, _, _, _) | visit::FnKind::Method(n, _, _) => {
                 &*n.as_str() == "new" || n.as_str().starts_with("new_")
             },
-            visit::FnKind::Closure(_) => return,
+            visit::FnKind::Closure => return,
         };
 
         if !in_derive_expn(span) {
@@ -302,20 +302,20 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnrootedPass {
     }
 }
 
-struct FnDefVisitor<'a, 'b: 'a, 'tcx: 'a + 'b> {
+struct FnDefVisitor<'a, 'tcx: 'a> {
     symbols: &'a Symbols,
-    cx: &'a LateContext<'b, 'tcx>,
+    cx: &'a LateContext<'tcx>,
     in_new_function: bool,
 }
 
-impl<'a, 'b, 'tcx> visit::Visitor<'tcx> for FnDefVisitor<'a, 'b, 'tcx> {
+impl<'a, 'tcx> visit::Visitor<'tcx> for FnDefVisitor<'a, 'tcx> {
     type Map = rustc_middle::hir::map::Map<'tcx>;
 
     fn visit_expr(&mut self, expr: &'tcx hir::Expr) {
         let cx = self.cx;
 
         let require_rooted = |cx: &LateContext, in_new_function: bool, subexpr: &hir::Expr| {
-            let ty = cx.tables.expr_ty(&subexpr);
+            let ty = cx.typeck_results().expr_ty(&subexpr);
             if is_unrooted_ty(&self.symbols, cx, ty, in_new_function) {
                 cx.lint(UNROOTED_MUST_ROOT, |lint| {
                     lint.build(&format!("Expression of type {:?} must be rooted", ty))
@@ -357,7 +357,7 @@ impl<'a, 'b, 'tcx> visit::Visitor<'tcx> for FnDefVisitor<'a, 'b, 'tcx> {
         match pat.kind {
             hir::PatKind::Binding(hir::BindingAnnotation::Unannotated, ..) |
             hir::PatKind::Binding(hir::BindingAnnotation::Mutable, ..) => {
-                let ty = cx.tables.pat_ty(pat);
+                let ty = cx.typeck_results().pat_ty(pat);
                 if is_unrooted_ty(&self.symbols, cx, ty, self.in_new_function) {
                     cx.lint(UNROOTED_MUST_ROOT, |lint| {
                         lint.build(&format!("Expression of type {:?} must be rooted", ty))
@@ -383,13 +383,14 @@ impl<'a, 'b, 'tcx> visit::Visitor<'tcx> for FnDefVisitor<'a, 'b, 'tcx> {
 /// usage e.g. with
 /// `match_def_path(cx, id, &["core", "option", "Option"])`
 fn match_def_path(cx: &LateContext, def_id: DefId, path: &[Symbol]) -> bool {
-    let krate = &cx.tcx.crate_name(def_id.krate);
+    let def_path = cx.tcx.def_path(def_id);
+    let krate = &cx.tcx.crate_name(def_path.krate);
     if krate != &path[0] {
         return false;
     }
 
     let path = &path[1..];
-    let other = cx.tcx.def_path(def_id).data;
+    let other = def_path.data;
 
     if other.len() != path.len() {
         return false;
@@ -398,13 +399,16 @@ fn match_def_path(cx: &LateContext, def_id: DefId, path: &[Symbol]) -> bool {
     other
         .into_iter()
         .zip(path)
-        .all(|(e, p)| e.data.as_symbol() == *p)
+        .all(|(e, p)| e.data.get_opt_name().as_ref() == Some(p))
 }
 
 fn in_derive_expn(span: Span) -> bool {
     matches!(
         span.ctxt().outer_expn_data().kind,
-        ExpnKind::Macro(MacroKind::Derive, _)
+        ExpnKind::Macro {
+            kind: MacroKind::Derive,
+            ..
+        }
     )
 }
 
@@ -438,7 +442,6 @@ symbols! {
     accountable_refcell
     Ref
     RefMut
-    slice
     Iter
     IterMut
     collections

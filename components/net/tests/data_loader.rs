@@ -6,8 +6,8 @@ use crate::fetch;
 use headers::{ContentType, HeaderMapExt};
 use hyper_serde::Serde;
 use mime::{self, Mime};
-use net_traits::request::{Origin, Request};
-use net_traits::response::ResponseBody;
+use net_traits::request::{Origin, Referrer, Request};
+use net_traits::response::{HttpsState, ResponseBody};
 use net_traits::{FetchMetadata, FilteredMetadata, NetworkError};
 use servo_url::ServoUrl;
 use std::ops::Deref;
@@ -21,7 +21,13 @@ fn assert_parse(
 ) {
     let url = ServoUrl::parse(url).unwrap();
     let origin = Origin::Origin(url.origin());
-    let mut request = Request::new(url, Some(origin), None);
+    let mut request = Request::new(
+        url,
+        Some(origin),
+        Referrer::NoReferrer,
+        None,
+        HttpsState::None,
+    );
 
     let response = fetch(&mut request, None);
 
@@ -38,7 +44,7 @@ fn assert_parse(
                     filtered: FilteredMetadata::Basic(m),
                     ..
                 }) => m,
-                result => panic!(result),
+                result => panic!("{:?}", result),
             };
             assert_eq!(metadata.content_type.map(Serde::into_inner), content_type);
             assert_eq!(metadata.charset.as_ref().map(String::deref), charset);

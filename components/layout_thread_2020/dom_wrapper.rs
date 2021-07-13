@@ -72,6 +72,7 @@ use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::Arc as StdArc;
+use style::animation::AnimationSetKey;
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::attr::AttrValue;
 use style::context::SharedStyleContext;
@@ -89,6 +90,7 @@ use style::shared_lock::{
 };
 use style::str::is_whitespace;
 use style::stylist::CascadeData;
+use style::values::{AtomIdent, AtomString};
 use style::CaseSensitivityExt;
 
 #[derive(Clone, Copy)]
@@ -349,6 +351,10 @@ impl<'ld> TDocument for ServoLayoutDocument<'ld> {
     fn is_html_document(&self) -> bool {
         self.document.is_html_document_for_layout()
     }
+
+    fn shared_lock(&self) -> &StyleSharedRwLock {
+        self.document.style_shared_lock()
+    }
 }
 
 impl<'ld> ServoLayoutDocument<'ld> {
@@ -468,12 +474,42 @@ impl<'le> TElement for ServoLayoutElement<'le> {
         }
     }
 
+    fn may_have_animations(&self) -> bool {
+        true
+    }
+
+    fn animation_rule(
+        &self,
+        context: &SharedStyleContext,
+    ) -> Option<Arc<StyleLocked<PropertyDeclarationBlock>>> {
+        let node = self.as_node();
+        let document = node.owner_doc();
+        context.animations.get_animation_declarations(
+            &AnimationSetKey::new_for_non_pseudo(node.opaque()),
+            context.current_time_for_animations,
+            document.style_shared_lock(),
+        )
+    }
+
+    fn transition_rule(
+        &self,
+        context: &SharedStyleContext,
+    ) -> Option<Arc<StyleLocked<PropertyDeclarationBlock>>> {
+        let node = self.as_node();
+        let document = node.owner_doc();
+        context.animations.get_transition_declarations(
+            &AnimationSetKey::new_for_non_pseudo(node.opaque()),
+            context.current_time_for_animations,
+            document.style_shared_lock(),
+        )
+    }
+
     fn state(&self) -> ElementState {
         self.element.get_state_for_layout()
     }
 
     #[inline]
-    fn has_attr(&self, namespace: &Namespace, attr: &LocalName) -> bool {
+    fn has_attr(&self, namespace: &style::Namespace, attr: &style::LocalName) -> bool {
         self.get_attr(namespace, attr).is_some()
     }
 
@@ -485,11 +521,11 @@ impl<'le> TElement for ServoLayoutElement<'le> {
     #[inline(always)]
     fn each_class<F>(&self, mut callback: F)
     where
-        F: FnMut(&Atom),
+        F: FnMut(&AtomIdent),
     {
         if let Some(ref classes) = self.element.get_classes_for_layout() {
             for class in *classes {
-                callback(class)
+                callback(AtomIdent::cast(class))
             }
         }
     }
@@ -585,26 +621,35 @@ impl<'le> TElement for ServoLayoutElement<'le> {
         self.element.has_selector_flags(flags)
     }
 
-    fn has_animations(&self) -> bool {
-        // We use this function not only for Gecko but also for Servo to know if this element has
-        // animations, so we maybe try to get the important rules of this element. This is used for
-        // off-main thread animations, but we don't support it on Servo, so return false directly.
-        false
+    fn has_animations(&self, context: &SharedStyleContext) -> bool {
+        // This is not used for pseudo elements currently so we can pass None.
+        return self.has_css_animations(context, /* pseudo_element = */ None) ||
+            self.has_css_transitions(context, /* pseudo_element = */ None);
     }
 
-    fn has_css_animations(&self) -> bool {
-        unreachable!("this should be only called on gecko");
+    fn has_css_animations(
+        &self,
+        context: &SharedStyleContext,
+        pseudo_element: Option<PseudoElement>,
+    ) -> bool {
+        let key = AnimationSetKey::new(self.as_node().opaque(), pseudo_element);
+        context.animations.has_active_animations(&key)
     }
 
-    fn has_css_transitions(&self) -> bool {
-        unreachable!("this should be only called on gecko");
+    fn has_css_transitions(
+        &self,
+        context: &SharedStyleContext,
+        pseudo_element: Option<PseudoElement>,
+    ) -> bool {
+        let key = AnimationSetKey::new(self.as_node().opaque(), pseudo_element);
+        context.animations.has_active_transitions(&key)
     }
 
     #[inline]
     fn lang_attr(&self) -> Option<SelectorAttrValue> {
         self.get_attr(&ns!(xml), &local_name!("lang"))
             .or_else(|| self.get_attr(&ns!(), &local_name!("lang")))
-            .map(|v| String::from(v as &str))
+            .map(|v| SelectorAttrValue::from(v as &str))
     }
 
     fn match_element_lang(
@@ -627,8 +672,8 @@ impl<'le> TElement for ServoLayoutElement<'le> {
         // so we can decide when to fall back to the Content-Language check.
         let element_lang = match override_lang {
             Some(Some(lang)) => lang,
-            Some(None) => String::new(),
-            None => self.element.get_lang_for_layout(),
+            Some(None) => AtomString::default(),
+            None => AtomString::from(&*self.element.get_lang_for_layout()),
         };
         extended_filtering(&element_lang, &*value)
     }
@@ -777,9 +822,9 @@ impl<'le> ::selectors::Element for ServoLayoutElement<'le> {
 
     fn attr_matches(
         &self,
-        ns: &NamespaceConstraint<&Namespace>,
-        local_name: &LocalName,
-        operation: &AttrSelectorOperation<&String>,
+        ns: &NamespaceConstraint<&style::Namespace>,
+        local_name: &style::LocalName,
+        operation: &AttrSelectorOperation<&AtomString>,
     ) -> bool {
         match *ns {
             NamespaceConstraint::Specific(ref ns) => self
@@ -909,7 +954,7 @@ impl<'le> ::selectors::Element for ServoLayoutElement<'le> {
     }
 
     #[inline]
-    fn has_id(&self, id: &Atom, case_sensitivity: CaseSensitivity) -> bool {
+    fn has_id(&self, id: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool {
         unsafe {
             (*self.element.id_attribute())
                 .as_ref()
@@ -918,16 +963,16 @@ impl<'le> ::selectors::Element for ServoLayoutElement<'le> {
     }
 
     #[inline]
-    fn is_part(&self, _name: &Atom) -> bool {
+    fn is_part(&self, _name: &AtomIdent) -> bool {
         false
     }
 
-    fn imported_part(&self, _: &Atom) -> Option<Atom> {
+    fn imported_part(&self, _: &AtomIdent) -> Option<AtomIdent> {
         None
     }
 
     #[inline]
-    fn has_class(&self, name: &Atom, case_sensitivity: CaseSensitivity) -> bool {
+    fn has_class(&self, name: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool {
         self.element.has_class_for_layout(name, case_sensitivity)
     }
 
@@ -1307,7 +1352,10 @@ impl<'le> ThreadSafeLayoutElement<'le> for ServoThreadSafeLayoutElement<'le> {
     }
 
     fn style_data(&self) -> AtomicRef<ElementData> {
-        self.element.borrow_data().expect("Unstyled layout node?")
+        match self.element.borrow_data() {
+            Some(data) => data,
+            None => panic!("could not find styles for <{}>", self.element.local_name()),
+        }
     }
 
     fn is_shadow_host(&self) -> bool {
@@ -1398,9 +1446,9 @@ impl<'le> ::selectors::Element for ServoThreadSafeLayoutElement<'le> {
 
     fn attr_matches(
         &self,
-        ns: &NamespaceConstraint<&Namespace>,
-        local_name: &LocalName,
-        operation: &AttrSelectorOperation<&String>,
+        ns: &NamespaceConstraint<&style::Namespace>,
+        local_name: &style::LocalName,
+        operation: &AttrSelectorOperation<&AtomString>,
     ) -> bool {
         match *ns {
             NamespaceConstraint::Specific(ref ns) => self
@@ -1432,23 +1480,23 @@ impl<'le> ::selectors::Element for ServoThreadSafeLayoutElement<'le> {
         false
     }
 
-    fn has_id(&self, _id: &Atom, _case_sensitivity: CaseSensitivity) -> bool {
+    fn has_id(&self, _id: &AtomIdent, _case_sensitivity: CaseSensitivity) -> bool {
         debug!("ServoThreadSafeLayoutElement::has_id called");
         false
     }
 
     #[inline]
-    fn is_part(&self, _name: &Atom) -> bool {
+    fn is_part(&self, _name: &AtomIdent) -> bool {
         debug!("ServoThreadSafeLayoutElement::is_part called");
         false
     }
 
-    fn imported_part(&self, _: &Atom) -> Option<Atom> {
+    fn imported_part(&self, _: &AtomIdent) -> Option<AtomIdent> {
         debug!("ServoThreadSafeLayoutElement::imported_part called");
         None
     }
 
-    fn has_class(&self, _name: &Atom, _case_sensitivity: CaseSensitivity) -> bool {
+    fn has_class(&self, _name: &AtomIdent, _case_sensitivity: CaseSensitivity) -> bool {
         debug!("ServoThreadSafeLayoutElement::has_class called");
         false
     }

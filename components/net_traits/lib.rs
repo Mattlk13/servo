@@ -30,6 +30,7 @@ use ipc_channel::router::ROUTER;
 use ipc_channel::Error as IpcError;
 use mime::Mime;
 use msg::constellation_msg::HistoryStateId;
+use servo_rand::RngCore;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use time::precise_time_ns;
 use webrender_api::{ImageData, ImageDescriptor, ImageKey};
@@ -156,6 +157,25 @@ impl From<ReferrerPolicyHeader> for ReferrerPolicy {
             ReferrerPolicyHeader::STRICT_ORIGIN => ReferrerPolicy::StrictOrigin,
             ReferrerPolicyHeader::STRICT_ORIGIN_WHEN_CROSS_ORIGIN => {
                 ReferrerPolicy::StrictOriginWhenCrossOrigin
+            },
+        }
+    }
+}
+
+impl From<ReferrerPolicy> for ReferrerPolicyHeader {
+    fn from(referrer_policy: ReferrerPolicy) -> Self {
+        match referrer_policy {
+            ReferrerPolicy::NoReferrer => ReferrerPolicyHeader::NO_REFERRER,
+            ReferrerPolicy::NoReferrerWhenDowngrade => {
+                ReferrerPolicyHeader::NO_REFERRER_WHEN_DOWNGRADE
+            },
+            ReferrerPolicy::SameOrigin => ReferrerPolicyHeader::SAME_ORIGIN,
+            ReferrerPolicy::Origin => ReferrerPolicyHeader::ORIGIN,
+            ReferrerPolicy::OriginWhenCrossOrigin => ReferrerPolicyHeader::ORIGIN_WHEN_CROSS_ORIGIN,
+            ReferrerPolicy::UnsafeUrl => ReferrerPolicyHeader::UNSAFE_URL,
+            ReferrerPolicy::StrictOrigin => ReferrerPolicyHeader::STRICT_ORIGIN,
+            ReferrerPolicy::StrictOriginWhenCrossOrigin => {
+                ReferrerPolicyHeader::STRICT_ORIGIN_WHEN_CROSS_ORIGIN
             },
         }
     }
@@ -341,6 +361,10 @@ impl ResourceThreads {
             storage_thread: s,
         }
     }
+
+    pub fn clear_cache(&self) {
+        let _ = self.core_thread.send(CoreResourceMsg::ClearCache);
+    }
 }
 
 impl IpcSend<CoreResourceMsg> for ResourceThreads {
@@ -439,6 +463,8 @@ pub enum CoreResourceMsg {
     RemoveHistoryStates(Vec<HistoryStateId>),
     /// Synchronization message solely for knowing the state of the ResourceChannelManager loop
     Synchronize(IpcSender<()>),
+    /// Clear the network cache.
+    ClearCache,
     /// Send the service worker network mediator for an origin to CoreResourceThread
     NetworkMediator(IpcSender<CustomResponseMediator>, ImmutableOrigin),
     /// Message forwarded to file manager's handler
@@ -694,6 +720,21 @@ impl Metadata {
             self.content_type = Some(Serde(ContentType::from(mime.clone())));
         }
     }
+
+    /// Set the referrer policy associated with the loaded resource.
+    pub fn set_referrer_policy(&mut self, referrer_policy: Option<ReferrerPolicy>) {
+        if self.headers.is_none() {
+            self.headers = Some(Serde(HeaderMap::new()));
+        }
+
+        self.referrer_policy = referrer_policy;
+        if let Some(referrer_policy) = referrer_policy {
+            self.headers
+                .as_mut()
+                .unwrap()
+                .typed_insert::<ReferrerPolicyHeader>(referrer_policy.into());
+        }
+    }
 }
 
 /// The creator of a given cookie
@@ -712,12 +753,17 @@ pub enum NetworkError {
     Internal(String),
     LoadCancelled,
     /// SSL validation error that has to be handled in the HTML parser
-    SslValidation(ServoUrl, String),
+    SslValidation(String, Vec<u8>),
 }
 
 impl NetworkError {
-    pub fn from_hyper_error(error: &HyperError) -> Self {
-        NetworkError::Internal(error.to_string())
+    pub fn from_hyper_error(error: &HyperError, cert_bytes: Option<Vec<u8>>) -> Self {
+        let s = error.to_string();
+        if s.contains("the handshake failed") {
+            NetworkError::SslValidation(s, cert_bytes.unwrap_or_default())
+        } else {
+            NetworkError::Internal(s)
+        }
     }
 
     pub fn from_http_error(error: &HttpError) -> Self {
@@ -805,4 +851,8 @@ impl WebrenderIpcSender {
             warn!("Error sending image update: {}", e);
         }
     }
+}
+
+lazy_static! {
+    pub static ref PRIVILEGED_SECRET: u32 = servo_rand::ServoRng::new().next_u32();
 }

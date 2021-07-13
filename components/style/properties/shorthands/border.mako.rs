@@ -17,9 +17,7 @@ ${helpers.four_sides_shorthand(
 ${helpers.four_sides_shorthand(
     "border-style",
     "border-%s-style",
-    "specified::BorderStyle::parse",
     engines="gecko servo-2013 servo-2020",
-    needs_context=False,
     spec="https://drafts.csswg.org/css-backgrounds/#border-style",
 )}
 
@@ -71,20 +69,20 @@ pub fn parse_border<'i, 't>(
     let mut any = false;
     loop {
         if width.is_none() {
-            if let Ok(value) = input.try(|i| BorderSideWidth::parse(context, i)) {
+            if let Ok(value) = input.try_parse(|i| BorderSideWidth::parse(context, i)) {
                 width = Some(value);
                 any = true;
             }
         }
         if style.is_none() {
-            if let Ok(value) = input.try(BorderStyle::parse) {
+            if let Ok(value) = input.try_parse(BorderStyle::parse) {
                 style = Some(value);
                 any = true;
                 continue
             }
         }
         if color.is_none() {
-            if let Ok(value) = input.try(|i| Color::parse(context, i)) {
+            if let Ok(value) = input.try_parse(|i| Color::parse(context, i)) {
                 color = Some(value);
                 any = true;
                 continue
@@ -114,7 +112,7 @@ pub fn parse_border<'i, 't>(
             'border-%s-%s' % (side, prop)
             for prop in ['color', 'style', 'width']
         )}"
-        alias="${maybe_moz_logical_alias(engine, (side, logical), '-moz-border-%s')}"
+        aliases="${maybe_moz_logical_alias(engine, (side, logical), '-moz-border-%s')}"
         spec="${spec}">
 
     pub fn parse_value<'i, 't>(
@@ -301,24 +299,24 @@ pub fn parse_border<'i, 't>(
             let mut border_image_${name} = border_image_${name}::get_initial_specified_value();
         % endfor
 
-        let result: Result<_, ParseError> = input.try(|input| {
+        let result: Result<_, ParseError> = input.try_parse(|input| {
             % for name in "outset repeat slice source width".split():
                 let mut ${name} = None;
             % endfor
             loop {
                 if slice.is_none() {
-                    if let Ok(value) = input.try(|input| border_image_slice::parse(context, input)) {
+                    if let Ok(value) = input.try_parse(|input| border_image_slice::parse(context, input)) {
                         slice = Some(value);
                         // Parse border image width and outset, if applicable.
-                        let maybe_width_outset: Result<_, ParseError> = input.try(|input| {
+                        let maybe_width_outset: Result<_, ParseError> = input.try_parse(|input| {
                             input.expect_delim('/')?;
 
                             // Parse border image width, if applicable.
-                            let w = input.try(|input|
+                            let w = input.try_parse(|input|
                                 border_image_width::parse(context, input)).ok();
 
                             // Parse border image outset if applicable.
-                            let o = input.try(|input| {
+                            let o = input.try_parse(|input| {
                                 input.expect_delim('/')?;
                                 border_image_outset::parse(context, input)
                             }).ok();
@@ -339,7 +337,7 @@ pub fn parse_border<'i, 't>(
                 }
                 % for name in "source repeat".split():
                     if ${name}.is_none() {
-                        if let Ok(value) = input.try(|input| border_image_${name}::parse(context, input)) {
+                        if let Ok(value) = input.try_parse(|input| border_image_${name}::parse(context, input)) {
                             ${name} = Some(value);
                             continue
                         }
@@ -407,7 +405,7 @@ pub fn parse_border<'i, 't>(
             ) -> Result<Longhands, ParseError<'i>> {
                 let start_value = border_${axis}_start_${prop}::parse(context, input)?;
                 let end_value =
-                    input.try(|input| border_${axis}_start_${prop}::parse(context, input))
+                    input.try_parse(|input| border_${axis}_start_${prop}::parse(context, input))
                         .unwrap_or_else(|_| start_value.clone());
 
                 Ok(expanded! {

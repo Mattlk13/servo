@@ -6,47 +6,44 @@ use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::GPUPipelineLayoutBinding::GPUPipelineLayoutMethods;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
 use dom_struct::dom_struct;
-use std::cell::Cell;
 use webgpu::{WebGPUBindGroupLayout, WebGPUPipelineLayout};
 
 #[dom_struct]
 pub struct GPUPipelineLayout {
     reflector_: Reflector,
-    bind_group_layouts: Vec<WebGPUBindGroupLayout>,
-    label: DomRefCell<Option<DOMString>>,
+    label: DomRefCell<Option<USVString>>,
     pipeline_layout: WebGPUPipelineLayout,
-    valid: Cell<bool>,
+    bind_group_layouts: Vec<WebGPUBindGroupLayout>,
 }
 
 impl GPUPipelineLayout {
     fn new_inherited(
-        bind_group_layouts: Vec<WebGPUBindGroupLayout>,
         pipeline_layout: WebGPUPipelineLayout,
-        valid: bool,
-    ) -> GPUPipelineLayout {
+        label: Option<USVString>,
+        bgls: Vec<WebGPUBindGroupLayout>,
+    ) -> Self {
         Self {
             reflector_: Reflector::new(),
-            bind_group_layouts,
-            label: DomRefCell::new(None),
+            label: DomRefCell::new(label),
             pipeline_layout,
-            valid: Cell::new(valid),
+            bind_group_layouts: bgls,
         }
     }
 
     pub fn new(
         global: &GlobalScope,
-        bind_group_layouts: Vec<WebGPUBindGroupLayout>,
         pipeline_layout: WebGPUPipelineLayout,
-        valid: bool,
-    ) -> DomRoot<GPUPipelineLayout> {
+        label: Option<USVString>,
+        bgls: Vec<WebGPUBindGroupLayout>,
+    ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(GPUPipelineLayout::new_inherited(
-                bind_group_layouts,
                 pipeline_layout,
-                valid,
+                label,
+                bgls,
             )),
             global,
         )
@@ -57,16 +54,20 @@ impl GPUPipelineLayout {
     pub fn id(&self) -> WebGPUPipelineLayout {
         self.pipeline_layout
     }
+
+    pub fn bind_group_layouts(&self) -> Vec<WebGPUBindGroupLayout> {
+        self.bind_group_layouts.clone()
+    }
 }
 
 impl GPUPipelineLayoutMethods for GPUPipelineLayout {
     /// https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label
-    fn GetLabel(&self) -> Option<DOMString> {
+    fn GetLabel(&self) -> Option<USVString> {
         self.label.borrow().clone()
     }
 
     /// https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label
-    fn SetLabel(&self, value: Option<DOMString>) {
+    fn SetLabel(&self, value: Option<USVString>) {
         *self.label.borrow_mut() = value;
     }
 }

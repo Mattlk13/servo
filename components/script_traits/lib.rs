@@ -49,7 +49,7 @@ use msg::constellation_msg::{
 use msg::constellation_msg::{PipelineNamespaceId, TopLevelBrowsingContextId};
 use net_traits::image::base::Image;
 use net_traits::image_cache::ImageCache;
-use net_traits::request::Referrer;
+use net_traits::request::{Referrer, RequestBody};
 use net_traits::storage_thread::StorageType;
 use net_traits::{FetchResponseMsg, ReferrerPolicy, ResourceThreads};
 use pixels::PixelFormat;
@@ -66,6 +66,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use style_traits::CSSPixel;
 use style_traits::SpeculativePainter;
+use webgpu::identity::WebGPUMsg;
 use webrender_api::units::{
     DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint, LayoutSize, WorldPoint,
 };
@@ -76,8 +77,8 @@ use webrender_api::{
 use webrender_api::{BuiltDisplayListDescriptor, HitTestFlags, HitTestResult};
 
 pub use crate::script_msg::{
-    DOMMessage, HistoryEntryReplacement, SWManagerMsg, SWManagerSenders, ScopeThings,
-    ServiceWorkerMsg,
+    DOMMessage, HistoryEntryReplacement, Job, JobError, JobResult, JobResultValue, JobType,
+    SWManagerMsg, SWManagerSenders, ScopeThings, ServiceWorkerMsg,
 };
 pub use crate::script_msg::{
     EventResult, IFrameSize, IFrameSizeMsg, LayoutMsg, LogEntry, ScriptMsg,
@@ -170,17 +171,19 @@ pub struct LoadData {
         serialize_with = "::hyper_serde::serialize"
     )]
     pub headers: HeaderMap,
-    /// The data.
-    pub data: Option<Vec<u8>>,
+    /// The data that will be used as the body of the request.
+    pub data: Option<RequestBody>,
     /// The result of evaluating a javascript scheme url.
     pub js_eval_result: Option<JsEvalResult>,
     /// The referrer.
-    pub referrer: Option<Referrer>,
+    pub referrer: Referrer,
     /// The referrer policy.
     pub referrer_policy: Option<ReferrerPolicy>,
 
     /// The source to use instead of a network response for a srcdoc document.
     pub srcdoc: String,
+    /// The inherited context is Secure, None if not inherited
+    pub inherited_secure_context: Option<bool>,
 }
 
 /// The result of evaluating a javascript scheme url.
@@ -199,8 +202,9 @@ impl LoadData {
         load_origin: LoadOrigin,
         url: ServoUrl,
         creator_pipeline_id: Option<PipelineId>,
-        referrer: Option<Referrer>,
+        referrer: Referrer,
         referrer_policy: Option<ReferrerPolicy>,
+        inherited_secure_context: Option<bool>,
     ) -> LoadData {
         LoadData {
             load_origin,
@@ -213,6 +217,7 @@ impl LoadData {
             referrer: referrer,
             referrer_policy: referrer_policy,
             srcdoc: "".to_string(),
+            inherited_secure_context,
         }
     }
 }
@@ -401,6 +406,8 @@ pub enum ConstellationControlMsg {
     PaintMetric(PipelineId, ProgressiveWebMetricType, u64),
     /// Notifies the media session about a user requested media session action.
     MediaSessionAction(PipelineId, MediaSessionActionType),
+    /// Notifies script thread that WebGPU server has started
+    SetWebGPUPort(IpcReceiver<WebGPUMsg>),
 }
 
 impl fmt::Debug for ConstellationControlMsg {
@@ -438,6 +445,7 @@ impl fmt::Debug for ConstellationControlMsg {
             PaintMetric(..) => "PaintMetric",
             ExitFullScreen(..) => "ExitFullScreen",
             MediaSessionAction(..) => "MediaSessionAction",
+            SetWebGPUPort(..) => "SetWebGPUPort",
         };
         write!(formatter, "ConstellationControlMsg::{}", variant)
     }
@@ -548,7 +556,7 @@ pub enum CompositorEvent {
     ),
     /// The mouse was moved over a point (or was moved out of the recognizable region).
     MouseMoveEvent(
-        Option<Point2D<f32>>,
+        Point2D<f32>,
         Option<UntrustedNodeAddress>,
         // Bitmask of MouseButton values representing the currently pressed buttons
         u16,
@@ -566,6 +574,8 @@ pub enum CompositorEvent {
     KeyboardEvent(KeyboardEvent),
     /// An event from the IME is dispatched.
     CompositionEvent(CompositionEvent),
+    /// Virtual keyboard was dismissed
+    IMEDismissedEvent,
 }
 
 /// Requests a TimerEvent-Message be sent after the given duration.
@@ -633,6 +643,8 @@ pub struct InitialScriptState {
     pub top_level_browsing_context_id: TopLevelBrowsingContextId,
     /// The ID of the opener, if any.
     pub opener: Option<BrowsingContextId>,
+    /// Loading into a Secure Context
+    pub inherited_secure_context: Option<bool>,
     /// A channel with which messages can be sent to us (the script thread).
     pub control_chan: IpcSender<ConstellationControlMsg>,
     /// A port on which messages sent by the constellation to script can be received.
@@ -640,7 +652,7 @@ pub struct InitialScriptState {
     /// A channel on which messages can be sent to the constellation from script.
     pub script_to_constellation_chan: ScriptToConstellationChan,
     /// A handle to register script-(and associated layout-)threads for hang monitoring.
-    pub background_hang_monitor_register: Option<Box<dyn BackgroundHangMonitorRegister>>,
+    pub background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
     /// A sender for the layout thread to communicate to the constellation.
     pub layout_to_constellation_chan: IpcSender<LayoutMsg>,
     /// A channel to schedule timer events.
@@ -693,6 +705,7 @@ pub trait ScriptThreadFactory {
         relayout_event: bool,
         prepare_for_screenshot: bool,
         unminify_js: bool,
+        local_script_source: Option<String>,
         userscripts_path: Option<String>,
         headless: bool,
         replace_surrogates: bool,
@@ -744,6 +757,8 @@ pub struct IFrameLoadInfo {
     pub new_pipeline_id: PipelineId,
     ///  Whether this iframe should be considered private
     pub is_private: bool,
+    ///  Whether this iframe should be considered secure
+    pub inherited_secure_context: Option<bool>,
     /// Wether this load should replace the current entry (reload). If true, the current
     /// entry will be replaced instead of a new entry being added.
     pub replace: HistoryEntryReplacement,
@@ -861,10 +876,14 @@ pub struct WorkerGlobalScopeInit {
     pub pipeline_id: PipelineId,
     /// The origin
     pub origin: ImmutableOrigin,
+    /// The creation URL
+    pub creation_url: Option<ServoUrl>,
     /// True if headless mode
     pub is_headless: bool,
     /// An optional string allowing the user agnet to be set for testing.
     pub user_agent: Cow<'static, str>,
+    /// True if secure context
+    pub inherited_secure_context: Option<bool>,
 }
 
 /// Common entities representing a network load origin
@@ -1095,12 +1114,11 @@ impl From<i32> for MediaSessionActionType {
 #[derive(Deserialize, Serialize)]
 pub enum WebrenderMsg {
     /// Inform WebRender of the existence of this pipeline.
-    SendInitialTransaction(DocumentId, webrender_api::PipelineId),
+    SendInitialTransaction(webrender_api::PipelineId),
     /// Perform a scroll operation.
-    SendScrollNode(DocumentId, LayoutPoint, ExternalScrollId, ScrollClamping),
+    SendScrollNode(LayoutPoint, ExternalScrollId, ScrollClamping),
     /// Inform WebRender of a new display list for the given pipeline.
     SendDisplayList(
-        DocumentId,
         webrender_api::Epoch,
         LayoutSize,
         webrender_api::PipelineId,
@@ -1111,7 +1129,6 @@ pub enum WebrenderMsg {
     /// Perform a hit test operation. The result will be returned via
     /// the provided channel sender.
     HitTest(
-        DocumentId,
         Option<webrender_api::PipelineId>,
         WorldPoint,
         HitTestFlags,
@@ -1135,15 +1152,8 @@ impl WebrenderIpcSender {
     }
 
     /// Inform WebRender of the existence of this pipeline.
-    pub fn send_initial_transaction(
-        &self,
-        document: DocumentId,
-        pipeline: webrender_api::PipelineId,
-    ) {
-        if let Err(e) = self
-            .0
-            .send(WebrenderMsg::SendInitialTransaction(document, pipeline))
-        {
+    pub fn send_initial_transaction(&self, pipeline: webrender_api::PipelineId) {
+        if let Err(e) = self.0.send(WebrenderMsg::SendInitialTransaction(pipeline)) {
             warn!("Error sending initial transaction: {}", e);
         }
     }
@@ -1151,14 +1161,14 @@ impl WebrenderIpcSender {
     /// Perform a scroll operation.
     pub fn send_scroll_node(
         &self,
-        document: DocumentId,
         point: LayoutPoint,
         scroll_id: ExternalScrollId,
         clamping: ScrollClamping,
     ) {
-        if let Err(e) = self.0.send(WebrenderMsg::SendScrollNode(
-            document, point, scroll_id, clamping,
-        )) {
+        if let Err(e) = self
+            .0
+            .send(WebrenderMsg::SendScrollNode(point, scroll_id, clamping))
+        {
             warn!("Error sending scroll node: {}", e);
         }
     }
@@ -1166,14 +1176,12 @@ impl WebrenderIpcSender {
     /// Inform WebRender of a new display list for the given pipeline.
     pub fn send_display_list(
         &self,
-        document: DocumentId,
         epoch: Epoch,
         size: LayoutSize,
         (pipeline, size2, list): (webrender_api::PipelineId, LayoutSize, BuiltDisplayList),
     ) {
         let (data, descriptor) = list.into_data();
         if let Err(e) = self.0.send(WebrenderMsg::SendDisplayList(
-            document,
             webrender_api::Epoch(epoch.0),
             size,
             pipeline,
@@ -1189,27 +1197,24 @@ impl WebrenderIpcSender {
     /// and a result is available.
     pub fn hit_test(
         &self,
-        document: DocumentId,
         pipeline: Option<webrender_api::PipelineId>,
         point: WorldPoint,
         flags: HitTestFlags,
     ) -> HitTestResult {
         let (sender, receiver) = ipc::channel().unwrap();
         self.0
-            .send(WebrenderMsg::HitTest(
-                document, pipeline, point, flags, sender,
-            ))
+            .send(WebrenderMsg::HitTest(pipeline, point, flags, sender))
             .expect("error sending hit test");
         receiver.recv().expect("error receiving hit test result")
     }
 
     /// Create a new image key. Blocks until the key is available.
-    pub fn generate_image_key(&self) -> ImageKey {
+    pub fn generate_image_key(&self) -> Result<ImageKey, ()> {
         let (sender, receiver) = ipc::channel().unwrap();
         self.0
             .send(WebrenderMsg::GenerateImageKey(sender))
-            .expect("error sending image key generation");
-        receiver.recv().expect("error receiving image key result")
+            .map_err(|_| ())?;
+        receiver.recv().map_err(|_| ())
     }
 
     /// Perform a resource update operation.
